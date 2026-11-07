@@ -58,7 +58,6 @@ describe("deriveLayout", () => {
   it("a phone never shows the Edit side-panel view (it has an Edit sub-tab)", () => {
     expect(effectiveSideView(phone, "edit")).toBe("assets");
     expect(effectiveSideView(desktop, "edit")).toBe("edit");
-    expect(effectiveSideView(phone, "midi")).toBe("midi");
   });
   it("on a phone the Track sub-tab or Mixer decides the panel", () => {
     expect(deriveLayout(phone, { ...base, mobileTab: "track", trackSubTab: "editor" }).activeDockView).toBe("editor");

@@ -55,6 +55,9 @@ const UNDOABLE = new Set<Action["type"]>([
   // The Composer's arrangement: sequences and lanes (see diffComposer).
   "COMPOSER_ADD_PATTERN", "COMPOSER_ADD_BLANK", "COMPOSER_DUPLICATE", "COMPOSER_PASTE", "COMPOSER_MOVE", "COMPOSER_SET_COLOR",
   "COMPOSER_REMOVE", "COMPOSER_ADD_LANE", "COMPOSER_REMOVE_LANE", "COMPOSER_RENAME_LANE", "COMPOSER_MOVE_LANE", "COMPOSER_SET_LANE_MODIFIERS",
+  // V2 clips and piano-roll notes.
+  "CLIP_CREATE", "CLIP_DUPLICATE", "CLIP_MOVE", "CLIP_RESIZE", "CLIP_RENAME", "CLIP_COLOR", "CLIP_DELETE", "CLIP_INSERT_PATTERN",
+  "CLIP_SET_MODIFIERS", "SET_PATTERN_TRACK_OFF", "CLIP_PASTE", "CLIP_CLEAR", "TRACK_PASTE", "BANK_PASTE", "ROLL_PASTE_NOTES", "ROLL_ADD_NOTE", "ROLL_MOVE_NOTES", "ROLL_RESIZE_NOTE", "ROLL_REMOVE_NOTES", "ROLL_SET_VELOCITY", "ROLL_DUPLICATE_NOTES",
 ]);
 
 /** Repeats of the same continuous edit on the same target fold into one undo step. */
@@ -65,6 +68,8 @@ function coalesceKey(action: Action): string | null {
       return `${action.type}:${action.patternId}:${action.noteId}`;
     case "SET_TRACK_NOTES_LFO": case "SET_TRACK_NOTES_TIE":
       return `${action.type}:${action.patternId}:${action.trackId}`;
+    case "CLIP_SET_MODIFIERS":
+      return `${action.type}:${action.sequenceId}:${Object.keys(action.patch).join(",")}`;
     case "COMPOSER_RENAME_LANE": // typing a name is one step
       return `${action.type}:${action.laneId}`;
     default:

@@ -461,7 +461,7 @@ describe("reducer, history, persistence", () => {
   it("drops the audio fields an earlier lane version stored (tracks, FX, automation) on load", () => {
     const p = twoCopies();
     const old = { ...p, composer: { lanes: [{ ...composerLanes(p)[0], trackIds: ["track-1"], fx: [{ id: "x" }], automation: [] }] } } as unknown as Project;
-    const loaded = projectReducer(createInitialProject(), { type: "LOAD_PROJECT", project: old });
+    const loaded = migrateComposer(old); // LOAD_PROJECT runs this, then splits the V1 song into clips (test/clips.test.ts)
     expect(Object.keys(composerLanes(loaded)[0]).sort()).toEqual(["id", "name", "sequences"]);
     expect(composerLanes(loaded)[0].sequences).toEqual(seqs(p));
   });
@@ -469,7 +469,7 @@ describe("reducer, history, persistence", () => {
   it("brings a single-timeline Composer project up to one lane on load", () => {
     const p = twoCopies();
     const legacy = { ...p, composer: { sequences: seqs(p) } } as unknown as Project;
-    const loaded = projectReducer(createInitialProject(), { type: "LOAD_PROJECT", project: legacy });
+    const loaded = migrateComposer(legacy);
     expect(composerLanes(loaded)).toHaveLength(1);
     expect(composerLanes(loaded)[0].sequences).toEqual(seqs(p));
     expect(migrateComposer(p)).toBe(p);

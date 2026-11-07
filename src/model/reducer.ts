@@ -4,6 +4,8 @@ import type { CopiedTrackConfig } from "./trackConfig";
 import type { Asset } from "./types";
 import * as project from "./project";
 import * as composer from "./composer";
+import * as clips from "./clips";
+import * as roll from "./roll";
 import * as fx from "./fx";
 import * as instruments from "./instruments";
 import * as eventLfo from "./eventLfo";
@@ -119,6 +121,27 @@ export type Action =
   | { type: "CLEAR_AUTOMATION_LANE"; target: FxTarget; fxId: FxId | null; parameter: string; patternId?: PatternId }
   | { type: "RESET_PATTERN_AUTOMATION"; patternId: PatternId; target: FxTarget }
   | { type: "REPLACE_AUTOMATION_RANGE"; target: FxTarget; fxId: FxId | null; parameter: string; from: number; to: number; events: AutomationEvent[]; patternId?: PatternId }
+  // V2 clips (model/clips.ts) and piano-roll notes (model/roll.ts)
+  | { type: "CLIP_CREATE"; trackId: TrackId; start: number; bars?: number }
+  | { type: "CLIP_DUPLICATE"; sequenceId: SequenceId }
+  | { type: "CLIP_MOVE"; sequenceId: SequenceId; start: number }
+  | { type: "CLIP_RESIZE"; sequenceId: SequenceId; bars: number }
+  | { type: "CLIP_RENAME"; sequenceId: SequenceId; name: string }
+  | { type: "CLIP_COLOR"; sequenceId: SequenceId; color: string }
+  | { type: "CLIP_DELETE"; sequenceId: SequenceId }
+  | { type: "CLIP_INSERT_PATTERN"; patternId: PatternId; start: number }
+  | { type: "ROLL_ADD_NOTE"; patternId: PatternId; trackId: TrackId; start: number; pitch: number; duration: number; velocity?: number; resolution?: number }
+  | { type: "ROLL_MOVE_NOTES"; patternId: PatternId; noteIds: NoteId[]; dStart: number; dPitch: number; resolution?: number }
+  | { type: "ROLL_RESIZE_NOTE"; patternId: PatternId; noteId: NoteId; duration: number; resolution?: number }
+  | { type: "ROLL_REMOVE_NOTES"; patternId: PatternId; noteIds: NoteId[] }
+  | { type: "ROLL_SET_VELOCITY"; patternId: PatternId; noteIds: NoteId[]; velocity: number }
+  | { type: "ROLL_DUPLICATE_NOTES"; patternId: PatternId; noteIds: NoteId[]; dStart: number }
+  | { type: "CLIP_SET_MODIFIERS"; sequenceId: SequenceId; patch: Partial<LaneModifiers> }
+  | { type: "CLIP_PASTE"; data: clips.ClipData; trackId: TrackId; start: number }
+  | { type: "CLIP_CLEAR"; sequenceId: SequenceId }
+  | { type: "TRACK_PASTE"; trackId: TrackId; data: clips.TrackData }
+  | { type: "BANK_PASTE"; bank: number; data: clips.BankData }
+  | { type: "ROLL_PASTE_NOTES"; patternId: PatternId; trackId: TrackId; notes: roll.CopiedRollNote[]; at: number; resolution?: number }
   | { type: "LOAD_PROJECT"; project: Project };
 
 /** After a track's source changes, drops source automation lanes the new source can't honour. */
@@ -329,7 +352,48 @@ export function projectReducer(state: Project, action: Action): Project {
       return automation.clearAutomationLane(state, action.target, action.fxId, action.parameter, action.patternId);
     case "RESET_PATTERN_AUTOMATION":
       return patternAutomation.clearPatternAutomation(state, action.patternId, action.target);
+    case "CLIP_CREATE":
+      return clips.createClip(state, action.trackId, action.start, action.bars)?.project ?? state;
+    case "CLIP_DUPLICATE":
+      return clips.duplicateClip(state, action.sequenceId)?.project ?? state;
+    case "CLIP_MOVE":
+      return clips.moveClip(state, action.sequenceId, action.start);
+    case "CLIP_RESIZE":
+      return clips.resizeClip(state, action.sequenceId, action.bars);
+    case "CLIP_RENAME":
+      return clips.renameClip(state, action.sequenceId, action.name);
+    case "CLIP_COLOR":
+      return clips.setClipColor(state, action.sequenceId, action.color);
+    case "CLIP_DELETE":
+      return clips.deleteClip(state, action.sequenceId);
+    case "CLIP_INSERT_PATTERN":
+      return clips.insertPatternAsClips(state, action.patternId, action.start);
+    case "ROLL_ADD_NOTE":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollAddNote(p, state.beatsPerBar, action.trackId, action.start, action.pitch, action.duration, action.velocity, action.resolution));
+    case "ROLL_MOVE_NOTES":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollMoveNotes(p, state.beatsPerBar, action.noteIds, action.dStart, action.dPitch, action.resolution));
+    case "ROLL_RESIZE_NOTE":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollResizeNote(p, state.beatsPerBar, action.noteId, action.duration, action.resolution));
+    case "ROLL_REMOVE_NOTES":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollRemoveNotes(p, action.noteIds));
+    case "ROLL_SET_VELOCITY":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollSetVelocity(p, action.noteIds, action.velocity));
+    case "ROLL_DUPLICATE_NOTES":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollDuplicateNotes(p, state.beatsPerBar, action.noteIds, action.dStart).pattern);
+    case "CLIP_SET_MODIFIERS":
+      return composer.setSequenceModifiers(state, action.sequenceId, action.patch);
+    case "CLIP_PASTE":
+      return clips.pasteClip(state, action.data, action.trackId, action.start)?.project ?? state;
+    case "CLIP_CLEAR":
+      return clips.clearClip(state, action.sequenceId);
+    case "TRACK_PASTE":
+      return clips.pasteTrackData(state, action.trackId, action.data);
+    case "BANK_PASTE":
+      return clips.pasteBankData(state, action.bank, action.data);
+    case "ROLL_PASTE_NOTES":
+      return project.updatePattern(state, action.patternId, (p) => roll.rollPasteNotes(p, state.beatsPerBar, action.trackId, action.notes, action.at, action.resolution).pattern);
     case "LOAD_PROJECT":
-      return composer.migrateComposer(action.project); // a project saved by the single-timeline Composer gets a lane
+      // A project saved by the single-timeline Composer gets a lane; a V1 song (sequences of many tracks) is split into clips per track.
+      return clips.normaliseSong(composer.migrateComposer(action.project));
   }
 }

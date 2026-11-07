@@ -379,6 +379,31 @@ export function laneModifiers(lane: ComposerLane | undefined): LaneModifiers {
   return lane?.modifiers ?? DEFAULT_LANE_MODIFIERS;
 }
 
+/** The modifiers a sequence plays with: its lane's combined with its own (transpose adds; velocity and gate multiply), kept in range. */
+export function effectiveModifiers(lane: ComposerLane | undefined, seq: ComposerSequence): LaneModifiers {
+  const l = laneModifiers(lane);
+  if (!seq.modifiers) return l;
+  return clampModifiers({ transpose: l.transpose + seq.modifiers.transpose, velocity: l.velocity * seq.modifiers.velocity, gate: l.gate * seq.modifiers.gate });
+}
+
+/** Sets (part of) one sequence's own modifiers; all-default is stored as none. */
+export function setSequenceModifiers(project: Project, id: SequenceId, patch: Partial<LaneModifiers>): Project {
+  const seq = sequenceById(project, id);
+  const lane = laneOfSequence(project, id);
+  if (!seq || !lane) return project;
+  const next = clampModifiers({ ...(seq.modifiers ?? DEFAULT_LANE_MODIFIERS), ...patch });
+  const modifiers = isIdentity(next) ? undefined : next;
+  if (modifiers === undefined && seq.modifiers === undefined) return project;
+  return mapLane(project, lane.id, (l) => ({
+    ...l,
+    sequences: l.sequences.map((s) => {
+      if (s.id !== id) return s;
+      const { modifiers: _old, ...rest } = s;
+      return modifiers ? { ...rest, modifiers } : rest;
+    }),
+  }));
+}
+
 function clampModifiers(m: LaneModifiers): LaneModifiers {
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   const round = (v: number, step: number) => Math.round(v / step) * step;
@@ -452,8 +477,8 @@ export function songInstances(project: Project): SongInstance[] {
   const bpb = project.beatsPerBar;
   const out: SongInstance[] = [];
   composerLanes(project).forEach((lane, laneIndex) => {
-    const modifiers = laneModifiers(lane);
     for (const seq of lane.sequences) {
+      const modifiers = effectiveModifiers(lane, seq);
       const pattern = patternOf(project, seq);
       if (!pattern || pattern.bars < 1) continue;
       const noteTracks = new Set(Object.values(pattern.notes).map((n) => n.trackId));

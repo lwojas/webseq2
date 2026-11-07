@@ -7,11 +7,10 @@ import { useMediaQuery } from "../hooks/useMediaQuery";
 /** The side panel (left of the timeline) is tabbed so further views can be added later without
  * another layout change: add an entry here and a matching branch in SidePanel's content render.
  * Edit (clipboard + bar tools) lives here, beside the grid it acts on; on a phone it is the Track
- * tab's Edit sub-tab instead, and the phone's Library offers only Assets and MIDI. */
-export type SidePanelView = "assets" | "midi" | "edit";
+ * tab's Edit sub-tab instead, and the phone's Library offers Assets and Patterns. */
+export type SidePanelView = "assets" | "edit";
 export const SIDE_PANEL_VIEWS: { id: SidePanelView; label: string }[] = [
   { id: "assets", label: "Assets" },
-  { id: "midi", label: "MIDI" },
   { id: "edit", label: "Edit" },
 ];
 
@@ -36,7 +35,7 @@ export const DESKTOP_DOCK_VIEWS: BottomPanelView[] = ["instrument", "fx", "edito
 /** A phone-sized viewport has no room for the side panel and dock beside the timeline (see
  * index.css's `@media (max-width: 768px)` block, which shows exactly one section at a time), so
  * it gets one bottom tab bar of four: the Timeline, the selected track's editors (Track), the
- * Mixer, and the Library (Assets / Patterns / MIDI). This is pure navigation state — the
+ * Mixer, and the Library (Assets / Patterns). This is pure navigation state — the
  * desktop's `sidePanelView`/`bottomPanelView` still own the content. */
 export type MobileTab = "timeline" | "track" | "mixer" | "library";
 export const MOBILE_TABS: { id: MobileTab; label: string }[] = [
@@ -56,11 +55,10 @@ export const TRACK_SUB_TABS: { id: TrackSubTab; label: string }[] = [
   { id: "edit", label: "Edit" },
 ];
 
-export type LibraryView = "assets" | "patterns" | "midi";
+export type LibraryView = "assets" | "patterns";
 export const LIBRARY_VIEWS: { id: LibraryView; label: string }[] = [
   { id: "assets", label: "Assets" },
   { id: "patterns", label: "Patterns" },
-  { id: "midi", label: "MIDI" },
 ];
 
 /** A phone view that takes the timeline's place instead of overlaying it: the pattern picker or ⋯

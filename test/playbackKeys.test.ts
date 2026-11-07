@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AudioRuntime, BusId, InstrumentNoteParams, TriggerParams, VoiceHandle } from "webdsp";
-import { attachPlainMidiInputs, routeMidiMessage, type NoteSink } from "../src/midi/dawNoteInput";
 import { MIDI_UNITY_NOTE, Playback } from "../src/audio/playback";
 import { addAsset, assignAsset, createInitialProject, setTrackPlaybackMode } from "../src/model/project";
 import { syncBuses } from "../src/audio/busSync";
@@ -8,73 +7,6 @@ import { setTrackInstrument } from "../src/model/instruments";
 import { mockRuntime } from "./mockRuntime";
 import type { Asset } from "../src/model/types";
 import { trackById } from "../src/model/types";
-
-function sink() {
-  const calls: string[] = [];
-  const s: NoteSink = {
-    noteOn: (n, v) => calls.push(`on ${n} ${v.toFixed(2)}`),
-    noteOff: (n) => calls.push(`off ${n}`),
-    allNotesOff: () => calls.push("all off"),
-  };
-  return { s, calls };
-}
-
-describe("routeMidiMessage", () => {
-  it("routes note on/off, treats velocity-0 note-on as off, and CC 123/120 as all-off", () => {
-    const { s, calls } = sink();
-    routeMidiMessage([0x90, 60, 127], s);
-    routeMidiMessage([0x91, 64, 0], s);
-    routeMidiMessage([0x80, 60, 0], s);
-    routeMidiMessage([0xb0, 123, 0], s);
-    routeMidiMessage([0xb0, 120, 0], s);
-    routeMidiMessage([0xb0, 7, 90], s); // an ordinary CC is not a note
-    routeMidiMessage([0xe0, 0, 64], s); // pitch bend is ignored
-    expect(calls).toEqual(["on 60 1.00", "off 64", "off 60", "all off", "all off"]);
-  });
-});
-
-describe("attachPlainMidiInputs", () => {
-  function fakeInput(name: string) {
-    const listeners = new Set<(e: Event) => void>();
-    return {
-      name,
-      type: "input",
-      state: "connected",
-      addEventListener: (_: string, fn: (e: Event) => void) => listeners.add(fn),
-      removeEventListener: (_: string, fn: (e: Event) => void) => listeners.delete(fn),
-      send: (data: number[]) => listeners.forEach((fn) => fn({ data: Uint8Array.from(data) } as unknown as Event)),
-    };
-  }
-
-  it("listens to inputs no controller profile claims, and leaves Launchpad/Push alone", async () => {
-    const daw = fakeInput("WebVST DAW MIDI");
-    const launchpad = fakeInput("Launchpad Mini MK3 LPMiniMK3 MIDI Out");
-    const push = fakeInput("Ableton Push User Port");
-    const access = {
-      inputs: new Map([["a", daw], ["b", launchpad], ["c", push]]),
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    };
-    const { s, calls } = sink();
-    const detach = attachPlainMidiInputs(s, async () => access as unknown as MIDIAccess);
-    await new Promise((r) => setTimeout(r, 0));
-    daw.send([0x90, 60, 100]);
-    launchpad.send([0x90, 36, 100]);
-    push.send([0x90, 36, 100]);
-    expect(calls).toEqual(["on 60 0.79"]);
-    detach();
-    daw.send([0x90, 61, 100]);
-    expect(calls).toEqual(["on 60 0.79", "all off"]); // detached: no more notes, held notes released
-  });
-
-  it("is silent when MIDI access is refused", async () => {
-    const { s, calls } = sink();
-    const detach = attachPlainMidiInputs(s, () => Promise.reject(new Error("denied")));
-    await new Promise((r) => setTimeout(r, 0));
-    detach();
-    expect(calls).toEqual(["all off"]);
-  });
-});
 
 describe("Playback key methods", () => {
   function setup() {

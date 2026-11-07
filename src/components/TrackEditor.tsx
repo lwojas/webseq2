@@ -55,7 +55,7 @@ const NOTE_NAMES = ["C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", 
 /** The note a pitch offset sounds as. For a synth with a Hz root, that is its real note
  * (root + offset, e.g. Bass 55 Hz = A-1); otherwise (samples, unpitched roots) only the
  * offset in semitones is meaningful. */
-function formatPitch(pitch: number, root: number | null, chop = false): string {
+export function formatPitch(pitch: number, root: number | null, chop = false): string {
   if (chop) return `Slice ${pitch + 1}`;
   if (root === null) return pitch === 0 ? "0 st" : `${pitch > 0 ? "+" : ""}${pitch} st`;
   const midi = Math.round(root + pitch);
@@ -72,7 +72,7 @@ function pitchLabel(pitch: number, root: number | null, slices: number | null, s
 }
 
 /** Lane label of a chord note: its root, e.g. "A1+2" (root plus the number of added tones). */
-function chordLabel(chord: NoteChord, trackRoot: number | null, scale: ProjectScale): string {
+export function chordLabel(chord: NoteChord, trackRoot: number | null, scale: ProjectScale): string {
   const [rootMidi] = chordMidis(scale, trackRoot, chord);
   const type = chordType(chord.type);
   const inversion = chord.inversion ? ` i${chord.inversion}` : "";
@@ -202,7 +202,7 @@ function ChordFields({ note, chord, root, scale, onSetNoteChord, onRemoveNote }:
 
 /** The contextual editor under one step. Memoised on the note object itself (the model only
  * replaces the note that was touched), so editing one note re-renders one card. */
-const NoteCard = memo(function NoteCard({
+export const NoteCard = memo(function NoteCard({
   note,
   root,
   slices,

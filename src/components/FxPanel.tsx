@@ -16,6 +16,8 @@ interface Props {
   /** FX send: `dest` null removes it; with a destination and an `amount` (0..1) only the level
    * changes, with a destination alone the send is created/re-pointed. */
   onSetSend: (trackId: TrackId, dest: TrackId | null, amount?: number) => void;
+  /** The shell offers routing elsewhere (V2's Mixer): leave the Output / Send row out. */
+  hideRouting?: boolean;
   fx: import("../model/types").FxInstance[];
   selectedFxId: FxId | null;
   onSelectFx: (id: FxId) => void;
@@ -46,6 +48,7 @@ export function FxPanel({
   tracks,
   onSetOutput,
   onSetSend,
+  hideRouting = false,
   fx,
   selectedFxId,
   onSelectFx,
@@ -70,7 +73,7 @@ export function FxPanel({
     <div className="fx-panel">
       <div className="fx-panel-head">
         <div className="fx-panel-title">{title} — FX CHAIN</div>
-        {track && <RoutingRow track={track} tracks={tracks} onSetOutput={onSetOutput} onSetSend={onSetSend} />}
+        {track && !hideRouting && <RoutingRow track={track} tracks={tracks} onSetOutput={onSetOutput} onSetSend={onSetSend} />}
       </div>
       <FxChainStrip fx={fx} selectedFxId={selectedFxId} onSelectFx={onSelectFx} onAddFx={onAddFx} onRemoveFx={onRemoveFx} onMoveFx={onMoveFx} />
 

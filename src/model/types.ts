@@ -319,6 +319,9 @@ export interface Pattern {
   /** Tracks whose notes do not play in this pattern (a "MIDI mute" that is per pattern; the notes are kept, and the track's own
    * mute is untouched). Absent = every track plays, so older projects are unchanged. model/patternSettings.ts. */
   offTracks?: Record<TrackId, true>;
+  /** V2 clips: set when this pattern is the content of a clip on that track's timeline row (model/clips.ts). Its notes are that
+   * track's alone. Absent on every V1 pattern; V1 ignores it. The Browser lists the patterns without it. */
+  clipOf?: TrackId;
 }
 
 /** What a pattern overrides on one track: either, both, or (not stored) neither. */
@@ -338,6 +341,9 @@ export interface ComposerSequence {
   start: number;
   /** Display colour (a CSS colour from COMPOSER_COLORS) — a property of this instance, not the pattern. */
   color: string;
+  /** V2 clip modifiers: this one sequence's own transpose / velocity / gate, applied on top of its lane's (transpose adds, velocity and
+   * gate multiply). Absent = none, so V1 files are unchanged. model/composer.ts effectiveModifiers. */
+  modifiers?: LaneModifiers;
 }
 
 /** Musical transformations a lane applies to the notes of the sequences on it, before they reach the instrument
@@ -363,6 +369,9 @@ export interface ComposerLane {
   sequences: ComposerSequence[];
   /** Absent = no modifiers. */
   modifiers?: LaneModifiers;
+  /** V2: this lane is that track's row on the arrangement, and its sequences are the track's clips (model/clips.ts). A track may own
+   * several lanes (overlapping material). Absent on a V1 lane, which model/clips.ts normaliseSong splits per track on load. */
+  trackId?: TrackId;
 }
 
 /** The song: lanes top to bottom. Kept in its own object so a project without one is unchanged. */

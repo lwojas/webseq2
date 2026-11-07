@@ -1,5 +1,7 @@
 import type { ComponentProps } from "react";
 import { LIBRARY_VIEWS, MAIN_VIEWS, type LayoutEnv, type LibraryView, type MainView, type MobileTab } from "./layout";
+import { MidiStatus } from "../components/MidiStatus";
+import type { MidiState } from "../midi/useMidi";
 import { MobileTopBar } from "../components/MobileTopBar";
 import { PatternStrip } from "../components/PatternStrip";
 import { ProjectBar } from "../components/ProjectBar";
@@ -17,6 +19,7 @@ interface Props {
   /** "16 beats / 1 bar" for the edited pattern. */
   subtitle: string;
   projectBar: ComponentProps<typeof ProjectBar>;
+  midi: MidiState;
   transport: Omit<ComponentProps<typeof TransportBar>, "variant">;
   patternStrip: ComponentProps<typeof PatternStrip>;
   mobileTopBar: ComponentProps<typeof MobileTopBar>;
@@ -37,6 +40,7 @@ export function Chrome({
   onRenameProject,
   subtitle,
   projectBar,
+  midi,
   transport,
   patternStrip,
   mobileTopBar,
@@ -66,6 +70,7 @@ export function Chrome({
         </div>
         <ProjectBar {...projectBar} />
         <div className="topbar-right">
+          <MidiStatus midi={midi} />
           <div className="subtitle">{subtitle}</div>
           <nav className="top-tabs" aria-label="View">
             {MAIN_VIEWS.map((view) => (

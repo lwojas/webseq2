@@ -1,0 +1,1813 @@
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { getHostState, hasEmbeddedHost, sameMidiRoute, type AudioRuntime, type MidiRoute } from "webdsp";
+import { forgetPeaks } from "../audio/peaks";
+import type { Asset, AssetId, AutomationLane, Project, ChainEntryId, FxId, FxTarget, FxType, InstrumentKindId, NoteId, PatternId, PlaybackMode, SampleEnvelope, SampleMode, Track, TrackEventLfo, TrackId, TrackLfo, VoiceMode } from "../model/types";
+import { useAutomationEditing } from "../app/useAutomationEditing";
+import { FX_KIND, fxChainsFor } from "../audio/fxChain";
+import { notesForTrack, trackById, trackHasSource } from "../model/types";
+import { findLane } from "../model/automation";
+import { lanesInPattern } from "../model/patternAutomation";
+import { BANK_SIZE, createInitialProject, pasteNotes, summarizeBanks, withMissingTracks } from "../model/project";
+import { DEFAULT_GRID_RESOLUTION, FREE_PLACEMENT_RESOLUTION, GRID_RESOLUTIONS, type CopiedNote, type GridResolution } from "../model/notes";
+import { adjacentPatternId } from "../model/patternNav";
+import { chainShiftForReorder, moveChainEntry } from "../model/project";
+import { buildEditPanelModel, trackLabel, type EditClipboard } from "../app/editModel";
+import { createHistory, historyReducer } from "../model/history";
+import { useAudioRuntime } from "../audio/useAudioRuntime";
+import { createHostSync } from "../audio/hostSync";
+import { compileNativeSequence } from "../audio/nativeSequence";
+import { automationSequenceEvents } from "../audio/automation";
+import { routeForTrack } from "../audio/midiRoute";
+import { instrumentHostFor } from "../audio/instruments";
+import { useTimelineZoom } from "../hooks/useTimelineZoom";
+import { usePlayingPosition } from "../hooks/usePlayingPosition";
+import { Transport, type PlaybackStatus } from "../audio/transport";
+import { createSmoothClock } from "../audio/smoothClock";
+import { Playback, type ManualPlaybackSnapshot } from "../audio/playback";
+import { ensureTrackBuses, busIdForTarget, type TrackBusMap } from "../audio/buses";
+import { syncBuses } from "../audio/busSync";
+import { encodeWav } from "../audio/wav";
+import { saveProject, loadProject, listProjects, deleteProject } from "../persistence/projectStore";
+import { remapAssetIds } from "../model/project";
+import type { NoteChord } from "../model/chord";
+import { createRecoveryScheduler, type RecoveryRecord } from "../persistence/recovery";
+import { HOST_PUBLISH_DEBOUNCE_MS, fromHostSnapshot, publishRecord, shouldWriteProject } from "../persistence/hostState";
+import { exportProjectFile, importProjectFile } from "../persistence/projectIO";
+import { preselectSavedProject } from "../persistence/savedSelection";
+import { putRecovery, getRecovery, getRecoveryAssets, clearRecovery, resetRecoveryAssetCache } from "../persistence/recoveryStore";
+import type { ResamplePhase } from "../components/TransportBar";
+import type { ImportBatchResult } from "../components/AssetsPanel";
+import type { ModulationUi } from "../components/ModulationSlot";
+import type { BarTool, ClipboardRow } from "../components/EditPanel";
+import { INSTRUMENT_KINDS } from "../model/instruments";
+import type { Recipe } from "../guide/recipes";
+import { pauseForGuide } from "../guide/session";
+import { automationSpans, describeSongPosition, sequencesOfPattern, type PlaybackSource } from "../model/composer";
+import { useComposer } from "../app/useComposer";
+import { deriveLayout, useLayout, type BottomPanelView, type LibraryView, type MainView, type MobileTab, type SidePanelView, type Takeover, type TrackSubTab } from "../app/layout";
+import { useMidi } from "../midi/useMidi";
+import type { NoteSink } from "../midi/midiInput";
+import { scaleOf, type ProjectScale } from "../model/scale";
+import type { ArpVelocity, TrackArp } from "../model/arp";
+
+/** Frees every sample the engine holds. New and Load replace the whole project, so the previous
+ * project's decoded audio would otherwise stay resident for the rest of the session (ECS-84).
+ * Callers stop the transport first, which silences any voice still reading one. */
+function releaseEngineSamples(rt: AudioRuntime): void {
+  for (const sample of rt.listSamples()) rt.removeSample(sample.id);
+}
+
+/** What the Edit panel gets while it isn't showing: shared empties, so nothing is allocated. */
+const NO_SPANS: { startBeat: number; beats: number; patternId: string; lane: AutomationLane | undefined }[] = [];
+const NO_EDIT_MODEL: { clipboardRows: ClipboardRow[]; barTools: BarTool[]; chopTools: BarTool[] } = { clipboardRows: [], barTools: [], chopTools: [] };
+
+/** How long the song must be unchanged before it is sent to a host that plays it natively. */
+const NATIVE_SEQUENCE_DEBOUNCE_MS = 150;
+/** How often a slow check looks for the engine having become ready to play more of the song. */
+const NATIVE_SEQUENCE_CHECK_MS = 500;
+
+
+/** Everything the app does, with no markup: project state, audio engine, transport, selection and every handler.
+ * Extracted from V1's App.tsx so that more than one shell can drive the same application (the V1 shell, the V2 DAW shell). */
+/** `editAlwaysBuilt`: a shell that offers the Edit tools from menus (V2) rather than from the Edit tab asks for them to be built on every render. */
+export function useWebseq({ editAlwaysBuilt = false }: { editAlwaysBuilt?: boolean } = {}) {
+  const { runtime, capabilities, error, init } = useAudioRuntime();
+  // Undo/redo wraps the project reducer (model/history.ts): `project` is still the single source of truth.
+  const [history, dispatch] = useReducer(historyReducer, undefined, () => createHistory(createInitialProject()));
+  const project = history.present;
+  // What the pattern strip, Patterns page, queue and pickers list: every pattern, Composer ones included.
+  const launcher = project.patterns;
+  const canUndo = history.past.length > 0;
+  const canRedo = history.future.length > 0;
+  const handleUndo = useCallback(() => dispatch({ type: "UNDO" }), []);
+  const handleRedo = useCallback(() => dispatch({ type: "REDO" }), []);
+
+  // Transport (and the FX-push effect below) read project state through this ref rather than
+  // a closed-over value, so the lookahead tick (running on a setInterval outside React's
+  // render cycle) always sees the latest project without needing to be reconstructed on
+  // every edit — same rationale as the original prototype's stateRef.
+  const projectRef = useRef(project);
+  projectRef.current = project;
+
+  const trackBusesRef = useRef<TrackBusMap>({});
+  const assetDataRef = useRef<Map<AssetId, ArrayBuffer>>(new Map());
+  const transportRef = useRef<Transport | null>(null);
+  // What Play plays (model/composer.ts): the pattern queue, or the Composer song. A ref as well as state because
+  // the Transport reads it on every tick; the state is what re-renders the toggle. Only changed through
+  // handleSetSource, which stops the transport first.
+  const [playbackSource, setPlaybackSourceState] = useState<PlaybackSource>("pattern");
+  const playbackSourceRef = useRef<PlaybackSource>("pattern");
+  const playbackRef = useRef<Playback | null>(null);
+
+  const [status, setStatus] = useState<PlaybackStatus>("stopped");
+  // The host tempo while following an external clock (audio/hostSync.ts); null when playing on our own.
+  const [followedBpm, setFollowedBpm] = useState<number | null>(null);
+  // Which asset is auditioning and which tracks are looping (ECS-83). Written only when the
+  // Playback actually changes, so this re-renders on starts/stops/ends, not per tick.
+  const [manual, setManual] = useState<ManualPlaybackSnapshot>({ auditionAssetId: null, loopingTrackIds: [] });
+  const [selectedPatternId, setSelectedPatternId] = useState(project.patterns[0].id);
+  const [sidePanelView, setSidePanelView] = useState<SidePanelView>("assets");
+  const [bottomPanelView, setBottomPanelView] = useState<BottomPanelView>("instrument");
+  const [mobileTab, setMobileTab] = useState<MobileTab>("timeline");
+  const [trackSubTab, setTrackSubTab] = useState<TrackSubTab>("instrument");
+  const [libraryView, setLibraryView] = useState<LibraryView>("assets");
+  const [takeover, setTakeover] = useState<Takeover>("none");
+  const layout = useLayout();
+  const [mainView, setMainView] = useState<MainView>("sequencer");
+  const [selectedTarget, setSelectedTarget] = useState<FxTarget>("master");
+  const [selectedFxId, setSelectedFxId] = useState<FxId | null>(null);
+  // Declared here, ahead of its original call site further down, because useMidiControls (ECS-155) now
+  // needs it too -- a device's contextual selection buttons and Master/clear button select through the
+  // same function a track row's click already does, never a separate setSelectedTarget call of their own.
+  const handleSelectTarget = useCallback((target: FxTarget) => {
+    setSelectedTarget(target);
+    setSelectedFxId(null);
+  }, []);
+  const [selectedNoteId, setSelectedNoteId] = useState<NoteId | null>(null);
+  // Which bank of 16 tracks the sequencer shows (ECS-84). View state only, not saved with the project.
+  const [activeBank, setActiveBank] = useState(0);
+  const [gridResolution, setGridResolution] = useState<GridResolution>(DEFAULT_GRID_RESOLUTION);
+  const { pxPerBeat, zoomPercent, canZoomIn, canZoomOut, onZoomIn, onZoomOut } = useTimelineZoom();
+  const [savedProjects, setSavedProjects] = useState<{ id: string; name: string }[]>([]);
+  const [loadTargetId, setLoadTargetId] = useState<string>("");
+  const [resamplePhase, setResamplePhase] = useState<ResamplePhase>("idle");
+  const [resampleError, setResampleError] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [importBatchResult, setImportBatchResult] = useState<ImportBatchResult | null>(null);
+  // ECS-112's clipboard contract: project-local (not the system clipboard), self-contained
+  // plain data (CopiedNote has no id/trackId — see notes.ts's doc comment), cleared on
+  // New/Load so a stale "copied from Track X" label can never outlive the project it names.
+  const [noteClipboard, setNoteClipboard] = useState<{ sourceTrackId: TrackId; notes: CopiedNote[] } | null>(null);
+  const [clipboardStatus, setClipboardStatus] = useState<string | null>(null);
+  // The Edit panel's object clipboard: one slot per object kind (so copying FX never discards a
+  // copied Track), each remembering where it came from for the panel's status text. Sequence has
+  // no slot here: it is the note clipboard above, so the Edit panel and Cmd+C/V share it. Cleared
+  // on New/Load with the others.
+  const [editClipboard, setEditClipboard] = useState<EditClipboard>({});
+
+  const getBusId = useCallback((target: FxTarget) => busIdForTarget(trackBusesRef.current, target), []);
+
+  // Manual voices (ECS-83) and Transport share one Playback, which must exist before Transport
+  // is built: Transport registers its mono voices with it. Refuses manual starts while a
+  // resample is armed or capturing, the same guard as the Transport's own resample state.
+  const ensurePlayback = useCallback(
+    (rt: AudioRuntime): Playback => {
+      if (!playbackRef.current) {
+        const playback = new Playback(rt, getBusId, () => (transportRef.current?.getResampleStatus() ?? "idle") !== "idle");
+        playback.subscribe(setManual);
+        playbackRef.current = playback;
+      }
+      return playbackRef.current;
+    },
+    [getBusId],
+  );
+
+  // Keep every track's bus assignment up to date (idempotent — see ensureTrackBuses) whenever
+  // the runtime is ready or the track list changes, and construct Transport once.
+  useEffect(() => {
+    if (!runtime) return;
+    trackBusesRef.current = ensureTrackBuses(runtime, project.tracks.map((t) => t.id), trackBusesRef.current);
+    if (!transportRef.current) {
+      transportRef.current = new Transport(runtime, () => projectRef.current, getBusId, ensurePlayback(runtime), createSmoothClock(() => runtime.getCurrentTime(), () => performance.now() / 1000), () => playbackSourceRef.current);
+    }
+  }, [runtime, project.tracks, getBusId, ensurePlayback]);
+
+  // A runtime hosted by a plugin needs no user gesture, and the host's transport can start before anyone
+  // clicks Play: bring the runtime up at startup so it can follow. In a browser this does nothing.
+  useEffect(() => {
+    if (hasEmbeddedHost()) void init();
+  }, [init]);
+
+  // Follow the host's transport when the runtime has one (a plugin host); never fires in a browser.
+  useEffect(() => {
+    if (!runtime) return;
+    const sync = createHostSync({
+      runtime,
+      getTransport: () => transportRef.current,
+      native: capabilities?.nativeSequence === true,
+      onChange: (bpm) => {
+        setStatus(transportRef.current?.getStatus() ?? "stopped");
+        setFollowedBpm(bpm);
+      },
+    });
+    return () => sync.dispose();
+  }, [runtime, capabilities?.nativeSequence]);
+
+  // MIDI in: every connected MIDI input plays the selected track (midi/useMidi.ts). A host that plays MIDI itself
+  // (capabilities.midiRouting) is told what a key plays (the effect below) and plays it natively; the page must not
+  // play the same notes again, so listening is suspended there.
+  const selectedTargetRef = useRef(selectedTarget);
+  selectedTargetRef.current = selectedTarget;
+  // A shell may listen to the keys as well (V2 records them into a clip); it sets this ref.
+  const noteTapRef = useRef<NoteSink | null>(null);
+  const midiSink = useMemo<NoteSink>(() => {
+    const heldTrack = new Map<number, Track>(); // the key's note-on track, so its note-off ends the same voice
+    const targetTrack = () => {
+      const target = selectedTargetRef.current;
+      return target === "master" ? undefined : trackById(projectRef.current, target);
+    };
+    return {
+      noteOn: (note, velocity) => {
+        if (!runtime || guideOpenRef.current) return; // the Musical Guide is modal: input behind it is ignored
+        noteTapRef.current?.noteOn(note, velocity);
+        const track = targetTrack();
+        if (track && ensurePlayback(runtime).noteOn(track, note, velocity)) heldTrack.set(note, track);
+      },
+      noteOff: (note) => {
+        noteTapRef.current?.noteOff(note);
+        const track = heldTrack.get(note);
+        if (track && runtime) ensurePlayback(runtime).noteOff(track, note);
+        heldTrack.delete(note);
+      },
+      allNotesOff: () => {
+        if (runtime) for (const [note, track] of heldTrack) ensurePlayback(runtime).noteOff(track, note);
+        heldTrack.clear();
+      },
+    };
+  }, [runtime, ensurePlayback]);
+  const midi = useMidi({ sink: midiSink, alwaysOn: hasEmbeddedHost(), suspended: !runtime || (hasEmbeddedHost() && !!capabilities?.midiRouting) });
+
+  // A host that can play incoming MIDI notes itself is told what a key plays: the selected track's sample or synth (audio/midiRoute.ts, the same
+  // mapping as Playback.noteOn). It then plays them natively, sample-accurately and with the window closed. Runs after every render, after the
+  // engine sync above has created instruments and buses, and sends only when the route changes; a target the engine does not know yet counts as
+  // no route, so it is sent once it exists.
+  const sentRouteRef = useRef<MidiRoute | null>(null);
+  useEffect(() => {
+    if (!runtime || !capabilities?.midiRouting) return;
+    const track = selectedTarget === "master" ? undefined : trackById(project, selectedTarget);
+    const wanted = routeForTrack(track, {
+      instrumentId: track ? instrumentHostFor(runtime).primaryInstrumentId(track.id) : undefined,
+      busId: track ? getBusId(track.id) : undefined,
+      captureBusy: resamplePhase === "pending" || resamplePhase === "processing",
+    });
+    const route = wanted && (wanted.kind === "instrument" || runtime.getSample(wanted.id)) ? wanted : null;
+    if (sameMidiRoute(sentRouteRef.current, route)) return;
+    sentRouteRef.current = route;
+    runtime.setMidiRoute(route);
+  });
+
+  // A host that can play the song itself (capabilities.nativeSequence) is handed it as a Sequence (audio/nativeSequence.ts) and plays it against
+  // the DAW's transport, with this window open or closed and in an offline bounce. Every change of the song (or of what the engine has to play it
+  // with: a sample finishing loading, an instrument being created) sends the whole sequence again; the host swaps it in at a block boundary
+  // without cutting sounding notes. A short pause collects a drag or typing into one send, and a slow check catches engine-side readiness that
+  // no React state announces. It sends only when the result differs.
+  const sentSequenceRef = useRef<{ project: Project | null; ready: string; json: string }>({ project: null, ready: "", json: "" });
+  const pushSequence = useCallback(() => {
+    if (!runtime || !capabilities?.nativeSequence) return;
+    const current = projectRef.current;
+    const instruments = instrumentHostFor(runtime);
+    // What the engine can play right now; a change here is a reason to compile again even if the project is the same object.
+    const ready = current.tracks
+      .map((t) => `${runtime.getSample(t.assetId ?? -1) ? 1 : 0}${instruments.instrumentIdFor(t.id, 0) ?? "-"}${getBusId(t.id) ?? "-"}`)
+      .join(",") + playbackSourceRef.current;
+    const sent = sentSequenceRef.current;
+    if (sent.project === current && sent.ready === ready) return;
+    const sequence = compileNativeSequence(current, {
+      getBusId,
+      instrumentIdFor: (trackId, voice) => instruments.instrumentIdFor(trackId, voice),
+      hasSample: (id) => runtime.getSample(id) !== undefined,
+      automation: (start, beats, scope, pattern) => automationSequenceEvents(runtime, current, getBusId, start, beats, scope, pattern),
+      source: playbackSourceRef.current,
+    });
+    const json = JSON.stringify(sequence);
+    sentSequenceRef.current = { project: current, ready, json: json === sent.json ? sent.json : json };
+    if (json !== sent.json) runtime.setSequence(sequence);
+  }, [runtime, capabilities, getBusId]);
+  useEffect(() => {
+    if (!runtime || !capabilities?.nativeSequence) return;
+    sentSequenceRef.current = { project: null, ready: "", json: "" }; // a fresh runtime/engine has no sequence yet
+    const timer = setInterval(pushSequence, NATIVE_SEQUENCE_CHECK_MS);
+    return () => clearInterval(timer);
+  }, [runtime, capabilities, pushSequence]);
+  useEffect(() => {
+    if (!runtime || !capabilities?.nativeSequence) return;
+    const timer = setTimeout(pushSequence, NATIVE_SEQUENCE_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [runtime, capabilities, project, playbackSource, pushSequence]);
+
+  // Manual voices whose track or asset changed under them (reassigned, removed) are released
+  // here. Cheap: it scans at most one entry per track.
+  useEffect(() => {
+    playbackRef.current?.reconcile(project);
+  }, [project]);
+
+  // Push the full FX + mixer state to the engine on every project change — covers live
+  // parameter edits (including volume/mute/solo drags), FX add/remove, and a freshly-loaded
+  // project. Automation's own per-tick updates (Transport.pollAutomation) only take over from
+  // here once playback starts. This is the same "dispatch -> reducer -> effect -> engine call"
+  // path for volume/mute/solo as for FX params — no separate mixer update mechanism.
+  useEffect(() => {
+    if (!runtime) return;
+    syncBuses(runtime, project, trackBusesRef.current);
+  }, [runtime, project]);
+
+  // Keep the pattern selection valid: jump to a newly-added pattern, or off a removed one.
+  const prevPatternIds = useRef(project.patterns.map((p) => p.id));
+  useEffect(() => {
+    const ids = project.patterns.map((p) => p.id);
+    const added = ids.find((id) => !prevPatternIds.current.includes(id));
+    if (added) {
+      setSelectedPatternId(added);
+    } else if (!ids.includes(selectedPatternId)) setSelectedPatternId(projectRef.current.patterns[0].id);
+    prevPatternIds.current = ids;
+  }, [project.patterns, selectedPatternId]);
+
+  // Keep the FX/automation selection valid as the selected target's chain changes.
+  useEffect(() => {
+    const owner = selectedTarget === "master" ? project.master : trackById(project, selectedTarget);
+    const fx = owner?.fx ?? [];
+    if (selectedFxId && !fx.some((f) => f.id === selectedFxId)) {
+      setSelectedFxId(null);
+    }
+  }, [project, selectedTarget, selectedFxId]);
+
+  const ensureTransport = useCallback(async (): Promise<Transport | null> => {
+    if (transportRef.current) return transportRef.current;
+    const rt = await init();
+    if (!rt) return null;
+    trackBusesRef.current = ensureTrackBuses(rt, projectRef.current.tracks.map((t) => t.id), trackBusesRef.current);
+    syncBuses(rt, projectRef.current, trackBusesRef.current);
+    const t = new Transport(rt, () => projectRef.current, getBusId, ensurePlayback(rt), createSmoothClock(() => rt.getCurrentTime(), () => performance.now() / 1000), () => playbackSourceRef.current);
+    transportRef.current = t;
+    return t;
+  }, [init, getBusId, ensurePlayback]);
+
+  const handlePlay = useCallback(async () => {
+    const transport = await ensureTransport();
+    transport?.play();
+    setStatus(transport?.getStatus() ?? "stopped");
+  }, [ensureTransport]);
+
+  const handlePause = useCallback(() => {
+    transportRef.current?.pause();
+    setStatus(transportRef.current?.getStatus() ?? "stopped");
+  }, []);
+
+  const handleStop = useCallback(() => {
+    transportRef.current?.stop();
+    setStatus(transportRef.current?.getStatus() ?? "stopped");
+  }, []);
+
+  // Switching what Play plays stops the transport first: a position in the queue means nothing in the song.
+  const handleSetSource = useCallback(
+    (source: PlaybackSource) => {
+      if (playbackSourceRef.current === source) return;
+      handleStop();
+      playbackSourceRef.current = source;
+      setPlaybackSourceState(source);
+    },
+    [handleStop],
+  );
+
+  // Queuing/removing a pattern is an ordinary project edit (model/project.ts's
+  // queuePatternNext/removeChainEntry) — "after whatever's currently playing" comes from
+  // Transport.getCurrentChainEntryId(), the one thing Transport still needs to expose for this.
+  const handleQueueNext = useCallback((patternId: PatternId) => {
+    dispatch({ type: "QUEUE_PATTERN_NEXT", patternId, afterEntryId: transportRef.current?.getCurrentChainEntryId() ?? null });
+  }, []);
+
+  // Targets one specific queue entry (PatternQueue's per-row Remove), not every occurrence of
+  // its pattern -- see model/project.ts's removeChainEntry doc comment.
+  const handleRemoveChainEntry = useCallback((entryId: ChainEntryId) => {
+    dispatch({ type: "REMOVE_CHAIN_ENTRY", entryId });
+  }, []);
+
+  // Reordering the queue while it plays: the transport walks the queue with an ever-increasing step
+  // counter, so a plain reorder would make "now" jump to another row and could repeat the sounding
+  // pattern next. Shift the counter by the playing entry's change of position, in the same event
+  // handler as the dispatch (a click: React flushes it before any scheduler tick can run), so the
+  // sounding entry stays "now" and the next step follows ITS successor in the new order.
+  const handleMoveChainEntry = useCallback((entryId: ChainEntryId, toIndex: number) => {
+    const current = projectRef.current;
+    const reordered = moveChainEntry(current, entryId, toIndex);
+    if (reordered === current) return;
+    const transport = transportRef.current;
+    if (transport && transport.getStatus() !== "stopped") {
+      transport.shiftChainSteps(chainShiftForReorder(current.patternChain, reordered.patternChain, transport.getCurrentChainEntryId()));
+    }
+    dispatch({ type: "MOVE_CHAIN_ENTRY", entryId, toIndex });
+  }, []);
+
+  // "bar 2 / 4" for whatever the transport is sounding. Reads refs only, so the callback is stable
+  // and the RafText readouts that use it never re-subscribe.
+  const getPlayingBarText = useCallback(() => {
+    const info = transportRef.current?.getPlayheadInfo();
+    if (!info || info.patternId == null) return "";
+    const current = projectRef.current;
+    const pattern = current.patterns.find((p) => p.id === info.patternId);
+    if (!pattern) return "";
+    const bar = Math.min(pattern.bars, Math.floor(info.beat / current.beatsPerBar) + 1);
+    return `bar ${bar} / ${pattern.bars}`;
+  }, []);
+
+  // Musical Guide open state (see the Musical Guide section below). MIDI input is ignored while it is open.
+  const [guideOpen, setGuideOpen] = useState(false);
+  const guideOpenRef = useRef(false);
+  guideOpenRef.current = guideOpen;
+
+  const handleBpmChange = useCallback((bpm: number) => {
+    dispatch({ type: "SET_BPM", bpm });
+    // Live BPM changes only take audible effect once the transport re-anchors its schedule —
+    // see Transport.retime()'s doc comment for why that's required for a click-free change.
+    transportRef.current?.retime();
+  }, []);
+
+  const handleScaleChange = useCallback((patch: Partial<ProjectScale>) => {
+    dispatch({ type: "SET_PROJECT_SCALE", patch });
+  }, []);
+
+  const handleSwingChange = useCallback((swing: number) => {
+    dispatch({ type: "SET_SWING", swing });
+    // Same re-anchoring requirement as BPM — see handleBpmChange above.
+    transportRef.current?.retime();
+  }, []);
+
+  const handleAddNote = useCallback(
+    (trackId: TrackId, start: number) => dispatch({ type: "ADD_NOTE", patternId: selectedPatternId, trackId, start }),
+    [selectedPatternId],
+  );
+  // `freePlacement` (Alt/Option held at drag-end, see NoteBlock) swaps the toolbar-selected
+  // musical-grid resolution for a fixed fine resolution rather than snapping to no grid at
+  // all — see model/notes.ts's resizeNote/moveNote doc comments for why.
+  const handleResizeNote = useCallback(
+    (noteId: NoteId, duration: number, freePlacement: boolean) =>
+      dispatch({
+        type: "RESIZE_NOTE",
+        patternId: selectedPatternId,
+        noteId,
+        duration,
+        resolution: freePlacement ? FREE_PLACEMENT_RESOLUTION : gridResolution,
+      }),
+    [selectedPatternId, gridResolution],
+  );
+  const handleMoveNote = useCallback(
+    (noteId: NoteId, start: number, freePlacement: boolean) =>
+      dispatch({
+        type: "MOVE_NOTE",
+        patternId: selectedPatternId,
+        noteId,
+        start,
+        resolution: freePlacement ? FREE_PLACEMENT_RESOLUTION : gridResolution,
+      }),
+    [selectedPatternId, gridResolution],
+  );
+  const handleRemoveNote = useCallback(
+    (noteId: NoteId) => dispatch({ type: "REMOVE_NOTE", patternId: selectedPatternId, noteId }),
+    [selectedPatternId],
+  );
+  // Deliberate whole-track clear (ECS-107). Only ever called with an explicit trackId — the
+  // keydown handler below gates it on selectedTarget already being a track (not "master"), and
+  // TrackRow's header button only renders for the selected track — so a highlighted track alone
+  // never clears by itself without a second, explicit action.
+  const handleClearTrack = useCallback(
+    (trackId: TrackId) => dispatch({ type: "CLEAR_TRACK_NOTES", patternId: selectedPatternId, trackId }),
+    [selectedPatternId],
+  );
+
+  // ECS-112: whole-track copy/paste. Copy scope is deliberately "every note on the selected
+  // track" rather than any finer selection — this app has no multi-note range-selection system,
+  // and building one solely for copy/paste would be exactly the kind of feature-specific
+  // machinery the parent brief (ECS-81) asks to avoid. `start` is carried through unchanged
+  // (see notes.ts's CopiedNote doc comment) — there's no "paste cursor" concept, so paste always
+  // reproduces the original beat positions, just under the destination trackId/pattern.
+  const handleCopyTrack = useCallback(
+    (trackId: TrackId) => {
+      const pattern = project.patterns.find((p) => p.id === selectedPatternId) ?? project.patterns[0];
+      const copied: CopiedNote[] = notesForTrack(pattern, trackId).map((n) => ({
+        start: n.start,
+        duration: n.duration,
+        velocity: n.velocity,
+        pitch: n.pitch,
+        chord: n.chord,
+        lfo: n.lfo,
+        ratchet: n.ratchet,
+        tie: n.tie,
+      }));
+      if (copied.length === 0) return;
+      setNoteClipboard({ sourceTrackId: trackId, notes: copied });
+      setClipboardStatus(`${trackLabel(project.tracks, trackId)} · ${copied.length} note${copied.length === 1 ? "" : "s"}`);
+    },
+    [project, selectedPatternId],
+  );
+  const handlePasteNotes = useCallback(() => {
+    if (!noteClipboard || selectedTarget === "master") return;
+    // Computed once here (for the feedback message) and again by the reducer below when
+    // PASTE_NOTES is actually applied — both calls are pure and see the same project, so they
+    // make identical pasted/skipped placement decisions (only the generated note ids differ,
+    // and those aren't shown to the user). See reducer.ts's PASTE_NOTES case for why this
+    // can't just dispatch the already-computed project directly.
+    const preview = pasteNotes(project, selectedPatternId, selectedTarget, noteClipboard.notes);
+    dispatch({ type: "PASTE_NOTES", patternId: selectedPatternId, trackId: selectedTarget, notes: noteClipboard.notes });
+    const label = trackLabel(project.tracks, selectedTarget);
+    setClipboardStatus(
+      preview.skipped === 0
+        ? `${label} · ${preview.pasted} note${preview.pasted === 1 ? "" : "s"}`
+        : `${label} · ${preview.pasted}/${preview.pasted + preview.skipped} notes — ${preview.skipped} skipped (no room)`,
+    );
+  }, [noteClipboard, selectedTarget, selectedPatternId, project]);
+
+  // Clears the transient clipboard feedback after a couple seconds — same pattern as
+  // saveStatus's own timer above.
+  useEffect(() => {
+    if (!clipboardStatus) return;
+    const timer = setTimeout(() => setClipboardStatus(null), 2000);
+    return () => clearTimeout(timer);
+  }, [clipboardStatus]);
+
+  // Decodes a local file via the runtime (unchanged mechanism — see the project brief's "the
+  // existing ability to load and play local audio must continue working") and adds it to the
+  // Asset Bin. Shared by the Assets panel's batch "+ Import" (import only, see importAssets
+  // below) and each track's "Load" button (import, then immediately assign — see
+  // handleImportAndAssignToTrack).
+  const importAsset = useCallback(
+    async (file: File): Promise<Asset | null> => {
+      const runtimeInstance = runtime ?? (await init());
+      if (!runtimeInstance) return null;
+      const arrayBuffer = await file.arrayBuffer();
+      const meta = await runtimeInstance.loadSample(arrayBuffer.slice(0), { name: file.name });
+      assetDataRef.current.set(meta.id, arrayBuffer);
+      const asset: Asset = {
+        id: meta.id,
+        name: meta.name,
+        type: "audio",
+        duration: meta.duration,
+        sampleRate: meta.sampleRate,
+        channels: meta.channels,
+        origin: "import",
+      };
+      dispatch({ type: "ADD_ASSET", asset });
+      return asset;
+    },
+    [runtime, init],
+  );
+
+  // Multi-file import for the Asset Bin's "+ Import" (ECS-130). Sequential, not Promise.all —
+  // each call allocates the next engine sample id and mutates the shared assetDataRef, same
+  // ordering concern as handleLoadProject's per-asset loop below. One file failing to decode
+  // doesn't stop the rest; the result is surfaced as a single end-of-batch summary rather than
+  // per-file UI, since importAsset itself had no error feedback before this.
+  const importAssets = useCallback(
+    async (files: File[]) => {
+      const failed: { name: string; message: string }[] = [];
+      for (const file of files) {
+        try {
+          const asset = await importAsset(file);
+          if (!asset) failed.push({ name: file.name, message: "Audio engine unavailable" });
+        } catch (err) {
+          failed.push({ name: file.name, message: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      setImportBatchResult({ total: files.length, failed });
+    },
+    [importAsset],
+  );
+
+  const handleAssignAsset = useCallback(
+    (trackId: TrackId, assetId: AssetId) => dispatch({ type: "ASSIGN_ASSET", trackId, assetId }),
+    [],
+  );
+  const handleRenameAsset = useCallback((assetId: AssetId, name: string) => dispatch({ type: "RENAME_ASSET", assetId, name }), []);
+
+  // Manual playback (ECS-83). Each one makes sure the runtime, buses and Playback exist first,
+  // since the first click may be the one that initialises audio. That await is still inside
+  // the user gesture, the same as Play.
+  const handleAuditionSlice = useCallback((assetId: AssetId, slice: number) => {
+    playbackRef.current?.auditionSlice(assetId, slice);
+  }, []);
+  const handleAuditionAsset = useCallback(
+    async (assetId: AssetId) => {
+      await ensureTransport();
+      playbackRef.current?.auditionAsset(assetId);
+    },
+    [ensureTransport],
+  );
+  const handleTriggerTrack = useCallback(
+    async (trackId: TrackId) => {
+      await ensureTransport();
+      const track = trackById(projectRef.current, trackId);
+      if (track) playbackRef.current?.pressTrack(track);
+    },
+    [ensureTransport],
+  );
+  // The engine stops any voice still playing this asset before freeing its PCM (webdsp's
+  // Engine::removeSample), so removing an asset mid-playback is safe. Its raw bytes are dropped
+  // here as well, so they don't stay in memory for the rest of the session (ECS-84).
+  const handleRemoveAsset = useCallback(
+    (assetId: AssetId) => {
+      runtime?.removeSample(assetId);
+      assetDataRef.current.delete(assetId);
+      forgetPeaks(assetId);
+      dispatch({ type: "REMOVE_ASSET", assetId });
+    },
+    [runtime],
+  );
+
+  const handleResample = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport) return;
+    const armed = transport.armResample();
+    if (!armed.ok) {
+      setResamplePhase("error");
+      setResampleError(armed.reason);
+      return;
+    }
+    setResamplePhase("pending");
+    setResampleError(null);
+    try {
+      const { metadata, channelData } = await armed.result;
+      setResamplePhase("processing");
+      const wavBytes = encodeWav(channelData.map((buf) => new Float32Array(buf)), metadata.sampleRate);
+      assetDataRef.current.set(metadata.id, wavBytes);
+      const resampleCount = projectRef.current.assets.filter((a) => a.origin === "resample").length + 1;
+      const asset: Asset = {
+        id: metadata.id,
+        name: `Resample ${String(resampleCount).padStart(2, "0")}`,
+        type: "audio",
+        duration: metadata.duration,
+        sampleRate: metadata.sampleRate,
+        channels: metadata.channels,
+        origin: "resample",
+        sourcePatternId: armed.patternId,
+      };
+      dispatch({ type: "ADD_ASSET", asset });
+      setResamplePhase("complete");
+    } catch (err) {
+      setResamplePhase("error");
+      setResampleError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  // Pattern navigation. ◀ ▶ and the [ ] keys step without opening the picker; picking from the
+  // picker selects AND closes it.
+  const handleStepPattern = useCallback(
+    (direction: -1 | 1) => setSelectedPatternId((current) => adjacentPatternId(projectRef.current.patterns, current, direction)),
+    [],
+  );
+  const handlePickPattern = useCallback((id: PatternId) => {
+    setSelectedPatternId(id);
+    setTakeover("none");
+  }, []);
+  const handleTogglePicker = useCallback(() => setTakeover((t) => (t === "picker" ? "none" : "picker")), []);
+  const handleToggleSettings = useCallback(() => setTakeover((t) => (t === "settings" ? "none" : "settings")), []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (guideOpenRef.current) return; // the Musical Guide owns the keyboard while it is open
+      if (e.key === "Escape") {
+        setTakeover("none");
+        return;
+      }
+      // [ and ] step to the previous/next pattern. Not while typing (the rename field etc.).
+      // In the Composer the keys below act on the selected track or pattern, which the Composer does not show: leave them off
+      // there (a sequence block handles its own Delete).
+      const inComposer = mainView === "composer";
+      if ((e.key === "[" || e.key === "]") && !e.metaKey && !e.ctrlKey && !e.altKey && !inComposer) {
+        const target = e.target as HTMLElement | null;
+        if (target && (target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName))) return;
+        handleStepPattern(e.key === "[" ? -1 : 1);
+        return;
+      }
+      // Cmd/Ctrl+Z undo, Shift+Cmd/Ctrl+Z or Ctrl+Y redo — not while typing, so text fields keep
+      // their own undo.
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key.toLowerCase() === "z" || e.key.toLowerCase() === "y")) {
+        const target = e.target as HTMLElement | null;
+        if (target && (target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName))) return;
+        e.preventDefault();
+        if (e.key.toLowerCase() === "y" || e.shiftKey) handleRedo();
+        else handleUndo();
+        return;
+      }
+      if ((e.key === "Backspace" || e.key === "Delete") && !inComposer) {
+        const target = e.target as HTMLElement | null;
+        if (target && (target.tagName === "INPUT" || target.tagName === "SELECT")) return;
+        // ECS-107: an individually selected step always takes precedence over whole-track
+        // clearing — merely having a track highlighted (selectedTarget, used for the FX panel)
+        // must never escalate a step deletion into a track clear.
+        if (selectedNoteId) {
+          dispatch({ type: "REMOVE_NOTE", patternId: selectedPatternId, noteId: selectedNoteId });
+          setSelectedNoteId(null);
+          return;
+        }
+        // No step selected: an explicitly selected track (not "master", which has no sequence)
+        // clears that track's notes in the current pattern only. Requires two deliberate
+        // actions — select the track, then press Delete/Backspace — the same explicitness
+        // TrackRow's equivalent header button requires for touch (see ECS-107's investigation).
+        if (selectedTarget !== "master") {
+          dispatch({ type: "CLEAR_TRACK_NOTES", patternId: selectedPatternId, trackId: selectedTarget });
+        }
+        return;
+      }
+      // ECS-128: Space toggles the existing transport, but only once the gesture veil is
+      // already dismissed (runtime truthy) — before that, Start must be an explicit click, not
+      // a key first pressed before the engine exists. `e.repeat` guards against holding the key
+      // down re-firing play/stop on every repeat event. Checks transportRef directly (as
+      // useMidiControls' isPlaying already does for ECS-131) rather than the `status` state, so
+      // this closure can't act on a stale play/stop value.
+      if (e.code === "Space" && runtime && !e.repeat) {
+        const target = e.target as HTMLElement | null;
+        if (
+          target &&
+          (target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName))
+        ) {
+          return;
+        }
+        e.preventDefault();
+        if (transportRef.current?.getStatus() === "playing") {
+          handleStop();
+        } else {
+          void handlePlay();
+        }
+        return;
+      }
+      // ECS-112: Cmd/Ctrl+C / Cmd/Ctrl+V for the whole-track note clipboard. Guarded the same
+      // way as Space above (text-entry/button targets excluded), plus `e.repeat` so holding the
+      // key doesn't re-copy/re-paste every repeat event. Only preventDefault once a track is
+      // actually selected and there's something to do, so a plain Cmd+C/V elsewhere on the page
+      // (no track selected, or copying real text in a focused field) is left alone.
+      if ((e.key === "c" || e.key === "C" || e.key === "v" || e.key === "V") && (e.metaKey || e.ctrlKey) && !e.repeat && !inComposer) {
+        const target = e.target as HTMLElement | null;
+        if (
+          target &&
+          (target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName))
+        ) {
+          return;
+        }
+        if (selectedTarget === "master") return;
+        if (e.key === "c" || e.key === "C") {
+          e.preventDefault();
+          handleCopyTrack(selectedTarget);
+        } else if (noteClipboard) {
+          e.preventDefault();
+          handlePasteNotes();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    selectedNoteId,
+    selectedPatternId,
+    selectedTarget,
+    runtime,
+    handlePlay,
+    handleStop,
+    noteClipboard,
+    handleCopyTrack,
+    handlePasteNotes,
+    handleStepPattern,
+    handleUndo,
+    handleRedo,
+    mainView,
+  ]);
+
+  const getPositionText = useCallback(() => {
+    if (playbackSourceRef.current === "song") {
+      const song = transportRef.current?.getSongPosition();
+      if (!song) return "— —";
+      const bar = Math.floor(song.songBeat / project.beatsPerBar) + 1;
+      const beatInBar = Math.floor(song.songBeat % project.beatsPerBar) + 1;
+      return `SONG  BAR ${bar}  BEAT ${String(beatInBar).padStart(2, "0")}`;
+    }
+    const info = transportRef.current?.getPlayheadInfo();
+    const pattern = project.patterns.find((p) => p.id === info?.patternId);
+    if (!info || !pattern) return "— —";
+    const bar = Math.floor(info.beat / project.beatsPerBar) + 1;
+    const beatInBar = Math.floor(info.beat % project.beatsPerBar) + 1;
+    return `${pattern.name}  BAR ${bar}  BEAT ${String(beatInBar).padStart(2, "0")}`;
+  }, [project.patterns, project.beatsPerBar]);
+
+  // The Composer's playhead and readout, from the same transport position (Song mode only).
+  const getSongBeat = useCallback(() => transportRef.current?.getSongPosition()?.songBeat ?? null, []);
+  const getSongText = useCallback(() => {
+    const song = transportRef.current?.getSongPosition();
+    return song ? describeSongPosition(projectRef.current, song.songBeat) : "stopped";
+  }, []);
+
+  const getPlayheadBeat = useCallback((): number | null => transportRef.current?.getPlayheadBeatFor(selectedPatternId) ?? null, [selectedPatternId]);
+
+  const getResampleLabel = useCallback(() => transportRef.current?.getResampleStatus() ?? "idle", []);
+
+  // --- FX / automation handlers ---
+  const handleAddFx = useCallback((type: FxType) => dispatch({ type: "ADD_FX", target: selectedTarget, fxType: type }), [selectedTarget]);
+  const handleRemoveFx = useCallback((fxId: FxId) => dispatch({ type: "REMOVE_FX", target: selectedTarget, fxId }), [selectedTarget]);
+  // Live spectrum of an FX's input for the EQ editor. Polled by the display until the FX sync has
+  // created the engine effect; null without an engine.
+  const spectrumTapFor = useCallback(
+    (fxId: FxId) => {
+      const bus = getBusId(selectedTarget);
+      if (!runtime || bus === undefined) return null;
+      const effect = fxChainsFor(runtime).engineIdOf(bus, fxId);
+      return effect === undefined ? null : { source: runtime, bus, effect };
+    },
+    [runtime, getBusId, selectedTarget],
+  );
+
+  const handleSetFxParam = useCallback(
+    (fxId: FxId, paramId: string, value: number) => dispatch({ type: "SET_FX_PARAM", target: selectedTarget, fxId, paramId, value }),
+    [selectedTarget],
+  );
+  const handleMoveFx = useCallback(
+    (fxId: FxId, index: number) => dispatch({ type: "MOVE_FX", target: selectedTarget, fxId, index }),
+    [selectedTarget],
+  );
+  const handleSetFxEnabled = useCallback(
+    (fxId: FxId, enabled: boolean) => dispatch({ type: "SET_FX_ENABLED", target: selectedTarget, fxId, enabled }),
+    [selectedTarget],
+  );
+  const handleAddFxLfo = useCallback(
+    (fxId: FxId, param: string) => dispatch({ type: "ADD_FX_LFO", target: selectedTarget, fxId, param }),
+    [selectedTarget],
+  );
+  const handleSetFxLfo = useCallback(
+    (fxId: FxId, index: number, patch: Partial<TrackLfo>) => dispatch({ type: "SET_FX_LFO", target: selectedTarget, fxId, index, patch }),
+    [selectedTarget],
+  );
+  const handleRemoveFxLfo = useCallback(
+    (fxId: FxId, index: number) => dispatch({ type: "REMOVE_FX_LFO", target: selectedTarget, fxId, index }),
+    [selectedTarget],
+  );
+
+  // --- mixer (volume/mute/solo) ---
+  const handleSetTrackVolume = useCallback(
+    (trackId: TrackId, volume: number) => dispatch({ type: "SET_TRACK_VOLUME", trackId, volume }),
+    [],
+  );
+  const handleSetTrackMuted = useCallback(
+    (trackId: TrackId, muted: boolean) => dispatch({ type: "SET_TRACK_MUTED", trackId, muted }),
+    [],
+  );
+  const handleSetTrackSoloed = useCallback(
+    (trackId: TrackId, soloed: boolean) => dispatch({ type: "SET_TRACK_SOLOED", trackId, soloed }),
+    [],
+  );
+
+  const handleSetTrackSend = useCallback(
+    (trackId: TrackId, dest: TrackId | null, amount?: number) =>
+      dispatch(
+        dest === null || amount === undefined
+          ? { type: "SET_TRACK_SEND", trackId, dest }
+          : { type: "SET_TRACK_SEND_AMOUNT", trackId, amount },
+      ),
+    [],
+  );
+
+  const handleSetTrackOutput = useCallback(
+    (trackId: TrackId, dest: TrackId | null) => dispatch({ type: "SET_TRACK_OUTPUT", trackId, dest }),
+    [],
+  );
+
+  const handleSetTrackPan = useCallback(
+    (trackId: TrackId, pan: number) => dispatch({ type: "SET_TRACK_PAN", trackId, pan }),
+    [],
+  );
+
+  // --- instrument (synth source, sample envelope, selected-note pitch/velocity) ---
+  const handleSetInstrument = useCallback(
+    (trackId: TrackId, kind: InstrumentKindId | null) => dispatch({ type: "SET_TRACK_INSTRUMENT", trackId, kind }),
+    [],
+  );
+  const handleSetInstrumentParam = useCallback(
+    (trackId: TrackId, paramId: string, value: number) => dispatch({ type: "SET_INSTRUMENT_PARAM", trackId, paramId, value }),
+    [],
+  );
+  const handleAddLfo = useCallback(
+    (trackId: TrackId, target: string) => dispatch({ type: "ADD_INSTRUMENT_LFO", trackId, target }),
+    [],
+  );
+  const handleSetLfo = useCallback(
+    (trackId: TrackId, index: number, patch: Partial<TrackLfo>) => dispatch({ type: "SET_INSTRUMENT_LFO", trackId, index, patch }),
+    [],
+  );
+  const handleRemoveLfo = useCallback(
+    (trackId: TrackId, index: number) => dispatch({ type: "REMOVE_INSTRUMENT_LFO", trackId, index }),
+    [],
+  );
+  const handleSetEnvelope = useCallback(
+    (assetId: AssetId, envelope: Partial<SampleEnvelope>) => dispatch({ type: "SET_ASSET_ENVELOPE", assetId, envelope }),
+    [],
+  );
+  const handleSetAssetGain = useCallback(
+    (assetId: AssetId, gain: number) => dispatch({ type: "SET_ASSET_GAIN", assetId, gain }),
+    [],
+  );
+  const handleSetNotePitch = useCallback(
+    (noteId: NoteId, pitch: number) => dispatch({ type: "SET_NOTE_PITCH", patternId: selectedPatternId, noteId, pitch }),
+    [selectedPatternId],
+  );
+  // Length from the Track Editor's select: exact values, so snapped to the free-placement
+  // resolution rather than the toolbar grid (which would round 1/4 to 1 on a 1-step grid).
+  const handleSetNoteDuration = useCallback(
+    (noteId: NoteId, duration: number) =>
+      dispatch({ type: "RESIZE_NOTE", patternId: selectedPatternId, noteId, duration, resolution: FREE_PLACEMENT_RESOLUTION }),
+    [selectedPatternId],
+  );
+  const handleSetTrackEventLfo = useCallback(
+    (trackId: TrackId, patch: Partial<TrackEventLfo>) => dispatch({ type: "SET_TRACK_EVENT_LFO", trackId, patternId: selectedPatternId, patch }),
+    [selectedPatternId],
+  );
+  const handleSetTrackNotesOff = useCallback(
+    (trackId: TrackId, off: boolean) => dispatch({ type: "SET_PATTERN_TRACK_OFF", patternId: selectedPatternId, trackId, off }),
+    [selectedPatternId],
+  );
+  const handleResetPatternSettings = useCallback(
+    (trackId: TrackId) => dispatch({ type: "RESET_PATTERN_TRACK_SETTINGS", patternId: selectedPatternId, trackId }),
+    [selectedPatternId],
+  );
+  const handleSetTrackArp = useCallback(
+    (trackId: TrackId, patch: Partial<Omit<TrackArp, "velocity">> & { velocity?: Partial<ArpVelocity> }) => dispatch({ type: "SET_TRACK_ARP", trackId, patternId: selectedPatternId, patch }),
+    [selectedPatternId],
+  );
+  const handleSetNoteLfo = useCallback(
+    (noteId: NoteId, amount: number) => dispatch({ type: "SET_NOTE_LFO", patternId: selectedPatternId, noteId, amount }),
+    [selectedPatternId],
+  );
+  const handleSetTrackNotesLfo = useCallback(
+    (trackId: TrackId, amount: number) => dispatch({ type: "SET_TRACK_NOTES_LFO", patternId: selectedPatternId, trackId, amount }),
+    [selectedPatternId],
+  );
+  const handleSetNoteMode = useCallback(
+    (noteId: NoteId, mode: "note" | "chord") => dispatch({ type: "SET_NOTE_MODE", patternId: selectedPatternId, noteId, mode }),
+    [selectedPatternId],
+  );
+  const handleSetNoteChord = useCallback(
+    (noteId: NoteId, patch: Partial<NoteChord>) => dispatch({ type: "SET_NOTE_CHORD", patternId: selectedPatternId, noteId, patch }),
+    [selectedPatternId],
+  );
+  const handleSetNoteTie = useCallback(
+    (noteId: NoteId, tie: boolean) => dispatch({ type: "SET_NOTE_TIE", patternId: selectedPatternId, noteId, tie }),
+    [selectedPatternId],
+  );
+  const handleSetTrackNotesTie = useCallback(
+    (trackId: TrackId, tie: boolean) => dispatch({ type: "SET_TRACK_NOTES_TIE", patternId: selectedPatternId, trackId, tie }),
+    [selectedPatternId],
+  );
+  const handleSetNoteRatchet = useCallback(
+    (noteId: NoteId, ratchet: number) => dispatch({ type: "SET_NOTE_RATCHET", patternId: selectedPatternId, noteId, ratchet }),
+    [selectedPatternId],
+  );
+  const handleSetNoteVelocity = useCallback(
+    (noteId: NoteId, velocity: number) => dispatch({ type: "SET_NOTE_VELOCITY", patternId: selectedPatternId, noteId, velocity }),
+    [selectedPatternId],
+  );
+
+  // --- playback mode / voice mode (ECS-82/ECS-87/ECS-88) ---
+  const handleSetTrackPlaybackMode = useCallback(
+    (trackId: TrackId, playbackMode: PlaybackMode) => dispatch({ type: "SET_TRACK_PLAYBACK_MODE", trackId, playbackMode }),
+    [],
+  );
+  const handleSetSampleMode = useCallback(
+    (trackId: TrackId, sampleMode: SampleMode) => dispatch({ type: "SET_TRACK_SAMPLE_MODE", trackId, sampleMode }),
+    [],
+  );
+  const handleSetCues = useCallback((assetId: AssetId, cues: number[]) => dispatch({ type: "SET_ASSET_CUES", assetId, cues }), []);
+  const handleSetChopStart = useCallback((assetId: AssetId, start: number) => dispatch({ type: "SET_ASSET_CHOP_START", assetId, start }), []);
+  const getAssetBytes = useCallback((assetId: AssetId) => assetDataRef.current.get(assetId), []);
+  const handleSetTrackVoiceMode = useCallback(
+    (trackId: TrackId, voiceMode: VoiceMode) => dispatch({ type: "SET_TRACK_VOICE_MODE", trackId, voiceMode }),
+    [],
+  );
+
+  const handleSetTrackEnvelope = useCallback(
+    (trackId: TrackId, envelope: Partial<SampleEnvelope> | null) => dispatch({ type: "SET_TRACK_ENVELOPE", trackId, envelope }),
+    [],
+  );
+  const handleSetTrackChokeGroup = useCallback(
+    (trackId: TrackId, chokeGroup: number | null) => dispatch({ type: "SET_TRACK_CHOKE_GROUP", trackId, chokeGroup }),
+    [],
+  );
+
+  // Changing tab always leaves a takeover view (picker / settings), which only exist on the Timeline.
+  const handleSelectMobileTab = useCallback((tab: MobileTab) => {
+    setMobileTab(tab);
+    setTakeover("none");
+  }, []);
+  const handleSelectLibraryView = useCallback((view: LibraryView) => {
+    setLibraryView(view);
+    if (view !== "patterns") setSidePanelView(view);
+  }, []);
+
+  // --- Musical Guide ---
+  // A modal over the sequencer. Opening pauses playback and makes everything behind it inert
+  // (focus, clicks, keys); the guard ref also covers the window key handler and MIDI input,
+  // which are not part of the inert subtree. Closing just removes the overlay: it never resumes
+  // playback and never touches the project (only "Try this" does, via APPLY_RECIPE).
+  const appRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    appRef.current?.toggleAttribute("inert", guideOpen);
+  }, [guideOpen]);
+  const handleOpenGuide = useCallback(() => {
+    if (pauseForGuide(transportRef.current)) setStatus(transportRef.current?.getStatus() ?? "stopped");
+    setGuideOpen(true);
+  }, []);
+  const handleCloseGuide = useCallback(() => setGuideOpen(false), []);
+  const getGuideRuntime = useCallback(async (): Promise<AudioRuntime | null> => runtime ?? (await init()), [runtime, init]);
+  const unavailableKinds = useMemo(() => {
+    const provided = capabilities?.instruments;
+    return provided ? INSTRUMENT_KINDS.filter((k) => !provided.some((i) => i.id === k)) : [];
+  }, [capabilities]);
+  const handleApplyRecipe = useCallback(
+    (recipe: Recipe) => dispatch({ type: "APPLY_RECIPE", recipe, patternId: selectedPatternId, trackId: selectedTarget === "master" ? null : selectedTarget, unavailableKinds }),
+    [selectedPatternId, selectedTarget, unavailableKinds],
+  );
+
+  // --- persistence ---
+  // A host with its own session (a plugin) keeps the project there; otherwise the local recovery slot does.
+  const hostState = useMemo(() => getHostState(), []);
+  const recoveryScheduler = useMemo(
+    () =>
+      createRecoveryScheduler({
+        debounceMs: hostState ? HOST_PUBLISH_DEBOUNCE_MS : undefined,
+        write: async (record) => {
+          if (hostState) publishRecord(hostState, record, assetDataRef.current);
+          else await putRecovery(record, assetDataRef.current);
+        },
+      }),
+    [hostState],
+  );
+  // A recoverable previous session found at startup, shown as a prompt until the user picks.
+  const [recoveryPrompt, setRecoveryPrompt] = useState<RecoveryRecord | null>(null);
+  // Snapshots stay off until the startup check has resolved (and its prompt been answered), so
+  // an edit made while the prompt is up can't overwrite the very record it offers. The check
+  // result also gates the first run: the pristine initial project is never snapshotted.
+  const [recoveryChecked, setRecoveryChecked] = useState(false);
+  useEffect(() => {
+    if (hostState) {
+      // The host's session is the source of truth: no recovery prompt, and edits publish from the start.
+      setRecoveryChecked(true);
+      return;
+    }
+    let cancelled = false;
+    getRecovery().then((record) => {
+      if (cancelled) return;
+      setRecoveryPrompt(record);
+      setRecoveryChecked(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [hostState]);
+  // The project object with nothing unsaved (initial / just New'd / just Loaded). Every reducer
+  // edit yields a new object, so `project !== baseline` means "edited since".
+  const cleanBaselineRef = useRef<Project>(project);
+  // The untouched initial project, and whether the host has said what its session holds (a snapshot or "nothing"):
+  // see shouldWriteProject for why a host publishes loads and new projects too, but not before it has answered.
+  const pristineRef = useRef<Project>(project);
+  const [hostAnswered, setHostAnswered] = useState(false);
+  useEffect(() => {
+    if (!recoveryChecked || recoveryPrompt) return;
+    if (!shouldWriteProject({ hosted: hostState !== null, hostAnswered, project, pristine: pristineRef.current, baseline: cleanBaselineRef.current })) return;
+    recoveryScheduler.schedule({
+      project,
+      ui: { selectedPatternId, selectedTarget, activeBank, gridResolution },
+    });
+  }, [recoveryChecked, recoveryPrompt, project, selectedPatternId, selectedTarget, activeBank, gridResolution, recoveryScheduler, hostState, hostAnswered]);
+  useEffect(() => () => recoveryScheduler.cancel(), [recoveryScheduler]);
+
+  const refreshSavedProjects = useCallback(() => {
+    listProjects().then(setSavedProjects);
+  }, []);
+  useEffect(() => refreshSavedProjects(), [refreshSavedProjects]);
+  // When the open project is one of the saved ones (same id: restored after being loaded or saved, e.g. a plugin window reopened
+  // onto its session), show which one in the list. Considered once per open project and only once the list has loaded; it never
+  // overrides a selection already made and does nothing when no saved project matches. Recovery itself is not involved.
+  const preselectedForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (savedProjects.length === 0 || preselectedForRef.current === project.id) return;
+    preselectedForRef.current = project.id;
+    setLoadTargetId((current) => preselectSavedProject(current, project.id, savedProjects));
+  }, [project.id, savedProjects]);
+
+  const handleSaveProject = useCallback(async () => {
+    setSaveStatus("saving");
+    setSaveError(null);
+    try {
+      await saveProject(project, assetDataRef.current);
+      // The recovery snapshot only covers the gap before a save (same as webtracker) — drop it
+      // so this saved session doesn't prompt for a restore next startup. A host's session is not
+      // a recovery slot: it keeps tracking the project.
+      if (!hostState) {
+        recoveryScheduler.cancel();
+        void clearRecovery();
+      }
+      refreshSavedProjects();
+      setSaveStatus("saved");
+    } catch (err) {
+      setSaveStatus("error");
+      setSaveError(err instanceof Error ? err.message : String(err));
+    }
+  }, [project, refreshSavedProjects, recoveryScheduler, hostState]);
+
+  // Clears the transient "Saved ✓" confirmation after a couple seconds — a UI-only timer for a
+  // toast message, not anything audio-timed, so a plain setTimeout is fine here (see
+  // audio/transport.ts for where wall-clock timers are actually forbidden).
+  useEffect(() => {
+    if (saveStatus !== "saved") return;
+    const timer = setTimeout(() => setSaveStatus("idle"), 2000);
+    return () => clearTimeout(timer);
+  }, [saveStatus]);
+
+  // Replaces the open project with `loaded` (a saved project or a recovery record's project):
+  // re-registers each asset's bytes with the engine, remaps ids, and swaps the project in.
+  // Shared by Load and Restore so both go through one path.
+  const installProject = useCallback(
+    async (runtimeInstance: AudioRuntime, source: Project, assetData: Map<AssetId, ArrayBuffer>): Promise<Project> => {
+      transportRef.current?.stop();
+      releaseEngineSamples(runtimeInstance);
+      const idMap = new Map<AssetId, AssetId>();
+      assetDataRef.current = new Map();
+      for (const asset of source.assets) {
+        const data = assetData.get(asset.id);
+        if (!data) continue;
+        const meta = await runtimeInstance.loadSample(data.slice(0), { name: asset.name });
+        idMap.set(asset.id, meta.id);
+        assetDataRef.current.set(meta.id, data);
+      }
+      const remapped = withMissingTracks(remapAssetIds(source, idMap));
+      // Deliberately NOT resetting trackBusesRef here: webdsp's createBus() hands buses out
+      // from a one-way counter (MAX_TRACK_BUSES = 32) with no release call, so wiping this map
+      // on every load would force a brand-new set of buses per load and exhaust the pool after
+      // just two — see ensureTrackBuses' doc comment. Every project has the same fixed,
+      // deterministic track ids (createInitialTracks: "track-1".."track-64" — there is no add/
+      // remove-track feature), so the existing id -> bus mapping is still correct for whatever
+      // project is loaded next; ensureTrackBuses only ever allocates for an id it hasn't seen.
+      // A pending recovery write belongs to the project being replaced (webtracker's ordering rule).
+      recoveryScheduler.cancel();
+      resetRecoveryAssetCache();
+      dispatch({ type: "LOAD_PROJECT", project: remapped });
+      setStatus("stopped");
+      // Not a correctness fix (track ids are fixed/deterministic across every project, so the
+      // clipboard's positions would still make sense, and a stale copied assetId already falls
+      // back to null on paste — see trackConfig.ts) — just avoids a copy from a previous
+      // project session confusingly outliving it (ECS-112/ECS-124).
+      setNoteClipboard(null);
+      setEditClipboard({});
+      return remapped;
+    },
+    [recoveryScheduler],
+  );
+
+  // --- project files (persistence/projectFile.ts): how a project moves between the browser and a plugin ---
+  const [fileError, setFileError] = useState<string | null>(null);
+  const handleExportProject = useCallback(async () => {
+    setFileError(null);
+    try {
+      await exportProjectFile(project, assetDataRef.current);
+    } catch (err) {
+      setFileError(err instanceof Error ? err.message : String(err));
+    }
+  }, [project]);
+
+  const handleImportProject = useCallback(async () => {
+    setFileError(null);
+    try {
+      const opened = await importProjectFile();
+      if (!opened) return; // cancelled
+      const runtimeInstance = runtime ?? (await init());
+      if (!runtimeInstance) return;
+      // Not marked clean: an imported project is new, unsaved work, so recovery (or the host's session) keeps it.
+      await installProject(runtimeInstance, opened.project, opened.assetData);
+    } catch (err) {
+      setFileError(err instanceof Error ? err.message : String(err));
+    }
+  }, [runtime, init, installProject]);
+
+  const handleLoadProject = useCallback(async () => {
+    if (!loadTargetId) return;
+    const loaded = await loadProject(loadTargetId);
+    if (!loaded) return;
+    const runtimeInstance = runtime ?? (await init());
+    if (!runtimeInstance) return;
+    // A freshly loaded project has nothing unsaved: don't snapshot it until it's edited.
+    const installed = await installProject(runtimeInstance, loaded.project, loaded.assetData);
+    cleanBaselineRef.current = installed;
+  }, [loadTargetId, runtime, init, installProject]);
+
+  // --- crash recovery (persistence/recovery.ts; modelled on webtracker's resume) ---
+  // Installs a recovered/hosted record: the project and its assets, then the view state, validated against the
+  // project actually installed.
+  const restoreRecord = useCallback(
+    async (runtimeInstance: AudioRuntime, record: RecoveryRecord, assetData: Map<AssetId, ArrayBuffer>) => {
+      const installed = await installProject(runtimeInstance, record.project, assetData);
+      const { ui } = record;
+      const patternId = installed.patterns.some((p) => p.id === ui.selectedPatternId) ? ui.selectedPatternId : installed.patterns[0].id;
+      setSelectedPatternId(patternId);
+      setSelectedTarget(ui.selectedTarget === "master" || installed.tracks.some((t) => t.id === ui.selectedTarget) ? ui.selectedTarget : "master");
+      setSelectedFxId(null);
+      setActiveBank(Number.isInteger(ui.activeBank) && ui.activeBank >= 0 ? ui.activeBank : 0);
+      if (GRID_RESOLUTIONS.includes(ui.gridResolution)) setGridResolution(ui.gridResolution);
+    },
+    [installProject],
+  );
+
+  const handleRestoreRecovery = useCallback(async () => {
+    if (!recoveryPrompt) return;
+    const record = recoveryPrompt;
+    const runtimeInstance = runtime ?? (await init());
+    if (!runtimeInstance) return;
+    try {
+      const assetData = await getRecoveryAssets(record);
+      await restoreRecord(runtimeInstance, record, assetData);
+      // The record stays in the slot: a restored session is still unsaved work, so (like
+      // webtracker) it keeps prompting until saved or discarded. The restore itself re-writes it.
+      setRecoveryPrompt(null);
+    } catch {
+      // Unreadable/incompatible data must never wedge startup: drop it and carry on.
+      void clearRecovery();
+      setRecoveryPrompt(null);
+    }
+  }, [recoveryPrompt, runtime, init, restoreRecord]);
+
+  // The host handed back the session's project: install it, silently (no prompt: the session is the truth).
+  // Re-subscribing (the runtime appearing) is handed the same snapshot again; it is installed once.
+  const restoredSnapshotRef = useRef<unknown>(null);
+  useEffect(() => {
+    if (!hostState) return;
+    return hostState.onRestore((snapshot) => {
+      setHostAnswered(true); // from here the session follows the project, whatever the answer was
+      if (!snapshot || restoredSnapshotRef.current === snapshot) return; // null: a new session, nothing saved
+      restoredSnapshotRef.current = snapshot;
+      const restored = fromHostSnapshot(snapshot);
+      if (!restored) return; // not ours, an unknown format or malformed: start fresh
+      void (async () => {
+        // Waits for the runtime if it is still starting (the host answers at once, usually before it is up).
+        const runtimeInstance = runtime ?? (await init());
+        if (!runtimeInstance) {
+          restoredSnapshotRef.current = null; // could not start the engine: a later delivery may try again
+          return;
+        }
+        try {
+          await restoreRecord(runtimeInstance, restored.record, restored.assetData);
+        } catch {
+          // keep running on the fresh project rather than wedge startup
+        }
+      })();
+    });
+  }, [hostState, runtime, init, restoreRecord]);
+
+  const handleDismissRecovery = useCallback(() => {
+    void clearRecovery();
+    setRecoveryPrompt(null);
+  }, []);
+
+  const handleNewProject = useCallback(() => {
+    transportRef.current?.stop();
+    if (runtime) releaseEngineSamples(runtime);
+    assetDataRef.current = new Map();
+    // See handleLoadProject's comment just above: trackBusesRef is intentionally kept, not
+    // reset, since webdsp has no way to release a bus and every project shares the same
+    // track ids.
+    const fresh = createInitialProject();
+    recoveryScheduler.cancel();
+    resetRecoveryAssetCache();
+    hostState?.clear(); // the session now starts from nothing too
+    cleanBaselineRef.current = fresh;
+    dispatch({ type: "LOAD_PROJECT", project: fresh });
+    setStatus("stopped");
+    setNoteClipboard(null);
+    setEditClipboard({});
+  }, [runtime, recoveryScheduler, hostState]);
+
+  const handleDeleteProject = useCallback(async () => {
+    if (!loadTargetId) return;
+    await deleteProject(loadTargetId);
+    setLoadTargetId("");
+    refreshSavedProjects();
+  }, [loadTargetId, refreshSavedProjects]);
+
+  const selectedPattern = project.patterns.find((p) => p.id === selectedPatternId) ?? project.patterns[0];
+  const bankSummaries = useMemo(
+    () => summarizeBanks(project, selectedPattern, manual.loopingTrackIds),
+    [project, selectedPattern, manual.loopingTrackIds],
+  );
+  const fxOwner = selectedTarget === "master" ? project.master : trackById(project, selectedTarget);
+  // ECS-107: whether FxPanel's "Clear sequence" control has anything to clear — master has no
+  // sequence, so this is always false for it. Checked here (not inside FxPanel) so the panel
+  // stays a pure render of what it's given, consistent with its existing props.
+  const selectedTrackHasNotes = selectedTarget !== "master" && notesForTrack(selectedPattern, selectedTarget).length > 0;
+  // ECS-124: same rationale as selectedTrackHasNotes above, for the "Copy config" control.
+  const selectedTrack = selectedTarget !== "master" ? trackById(project, selectedTarget) : undefined;
+  // The modulation slot's option lists come from the engine (never per-synth tables here): the
+  // selected synth's own modulation targets plus the shared waveform / division lists.
+  const selectedKindId = selectedTrack?.instrument?.kind;
+  const modulationUi = useMemo<ModulationUi | null>(() => {
+    if (!runtime || !selectedKindId || !runtime.getModulationInfo) return null;
+    const kind = runtime.getCapabilities().instruments.find((k) => k.id === selectedKindId)?.kind;
+    if (kind === undefined) return null;
+    const info = runtime.getModulationInfo();
+    return {
+      maxLfos: info.maxLfos,
+      waveforms: info.waveforms,
+      divisions: info.divisions.map((d) => d.name),
+      targets: runtime.getModulationTargets(kind).map((p) => p.name),
+    };
+  }, [runtime, selectedKindId]);
+  const selectedTrackAsset =
+    selectedTrack?.assetId != null ? (project.assets.find((a) => a.id === selectedTrack.assetId) ?? null) : null;
+  const selectedTrackAssetUseCount =
+    selectedTrackAsset == null ? 0 : project.tracks.filter((t) => t.assetId === selectedTrackAsset.id).length;
+  const selectedNote =
+    selectedNoteId && selectedTrack ? (selectedPattern.notes[selectedNoteId] ?? null) : null;
+  // The Edit panel's rows are closures over the selection and clipboard; build them only while the
+  // panel is actually showing (the Edit tab of the side panel on desktop, the Track tab's Edit
+  // sub-tab on a phone) instead of on every render of the app.
+  const editShowing = editAlwaysBuilt || (layout.isPhone ? mobileTab === "track" && trackSubTab === "edit" : sidePanelView === "edit");
+  const { clipboardRows, barTools, chopTools } = editShowing
+    ? buildEditPanelModel({
+        project,
+        selectedTrack,
+        selectedPattern,
+        selectedNote,
+        selectedTrackHasNotes,
+        editClipboard,
+        setEditClipboard,
+        noteClipboard,
+        activeBank,
+        dispatch,
+        setClipboardStatus,
+        onCopySequence: handleCopyTrack,
+        onPasteSequence: handlePasteNotes,
+        onClearSequence: handleClearTrack,
+      })
+    : NO_EDIT_MODEL;
+  const playheadInfo = transportRef.current?.getPlayheadInfo();
+  // Polled, unlike playheadInfo above -- the queue now advances on its own (see
+  // Project.patternChain's doc comment), so PatternStrip/PatternList/PatternQueue's highlighting
+  // needs a real state update on a boundary crossing even when nothing else re-renders the
+  // app (see usePlayingPosition's doc comment).
+  const { patternId: playingPatternId, chainEntryId: playingChainEntryId, sequenceIds: playingSequenceKey } = usePlayingPosition(transportRef, status === "playing");
+  const playingSequenceIds = useMemo(() => new Set(playingSequenceKey ? playingSequenceKey.split(",") : []), [playingSequenceKey]);
+
+  // --- layout ---
+  // What is showing where is decided by deriveLayout (and rendered by Chrome / Workspace); App only
+  // owns the state and the behaviour.
+  const derived = deriveLayout(layout, { mobileTab, mainView, takeover, bottomPanelView, trackSubTab, libraryView });
+  // Automation (a base-value curve) and the engine's LFO bank are two kinds of modulation source;
+  // both are edited through the same card. The focused lane is drawn as a row of the timeline.
+  const { automationFor, row: automationRow, laneFocus: automationFocus } = useAutomationEditing({
+    project,
+    dispatch,
+    selectedTarget,
+    pattern: selectedPattern,
+    pxPerBeat,
+    timelineVisible: derived.timelineVisible,
+  });
+  // The engine's LFO options for an FX type (its own modulation targets plus the shared waveform /
+  // division lists), like modulationUi below does for a synth.
+  const fxLfoUi = useCallback(
+    (type: FxType): ModulationUi | null => {
+      if (!runtime?.getModulationInfo || !runtime.getEffectModulationTargets) return null;
+      const info = runtime.getModulationInfo();
+      return {
+        maxLfos: info.maxLfos,
+        waveforms: info.waveforms,
+        divisions: info.divisions.map((d) => d.name),
+        targets: runtime.getEffectModulationTargets(FX_KIND[type]).map((p) => p.name),
+      };
+    },
+    [runtime],
+  );
+  const handleSelectDockView = (view: BottomPanelView) => {
+    if (layout.isPhone) setTrackSubTab(view as TrackSubTab);
+    else setBottomPanelView(view);
+  };
+  const handleSelectMainView = (view: MainView) => {
+    setMainView(view);
+    setTakeover("none");
+    // Entering the Composer: the selected sequence is the pattern the dock and automation follow, and an idle
+    // transport switches to the song (a running one is left alone; the Song/Pattern toggle changes it).
+    if (view === "composer") {
+      if (composer.sequence) setSelectedPatternId(composer.sequence.patternId);
+      if (status === "stopped") handleSetSource("song");
+      if (!layout.isPhone) setSidePanelView("edit"); // the Composer's detail controls live in the Edit panel
+    }
+  };
+
+  // --- Composer (model/composer.ts, app/useComposer.ts) ---
+  // The Composer replaces the grid (see Workspace) and is another view of the same project: selecting a sequence selects
+  // its pattern and its lane's FX, and "Edit Sequence" switches to the Sequencer on that same pattern — there is no
+  // second editing path.
+  // "Play from here": the song from a beat, whatever was playing before.
+  const handlePlaySongFrom = async (beat: number) => {
+    handleSetSource("song");
+    const transport = await ensureTransport();
+    transport?.playFromBeat(beat);
+    setStatus(transport?.getStatus() ?? "stopped");
+  };
+  // Where the focused automation lane plays in the song (the same lane the grid shows) -- for the Composer to draw it over.
+  const composerAutomationSpans = useMemo(
+    () => {
+      if (mainView !== "composer" || !automationRow || !automationFocus) return NO_SPANS;
+      // Each sequence shows the lane its own pattern plays (its own, else the track's), so they can differ.
+      return automationSpans(project, selectedTarget).map((span) => ({
+        ...span,
+        lane: findLane(lanesInPattern(project, project.patterns.find((p) => p.id === span.patternId), selectedTarget), automationFocus.fxId, automationFocus.parameter),
+      }));
+    },
+    [mainView, automationRow, automationFocus, project, selectedTarget],
+  );
+  const composerAutomationEdit = useMemo(
+    () =>
+      automationFocus
+        ? {
+            onSetPoint: (patternId: string, position: number, value: number) =>
+              dispatch({ type: "SET_AUTOMATION_POINT", target: selectedTarget, fxId: automationFocus.fxId, parameter: automationFocus.parameter, position, value, patternId }),
+            onRemovePoint: (patternId: string, position: number) =>
+              dispatch({ type: "REMOVE_AUTOMATION_POINT", target: selectedTarget, fxId: automationFocus.fxId, parameter: automationFocus.parameter, position, patternId }),
+          }
+        : { onSetPoint: () => {}, onRemovePoint: () => {} },
+    [automationFocus, selectedTarget],
+  );
+  const composer = useComposer({
+    project,
+    dispatch,
+    launcher,
+    selectedPatternId,
+    setSelectedPatternId,
+    setMainView,
+    makePlayable: (patternId) => {
+      // Opened from the Composer: Play (Pattern mode) plays this pattern, with no trip to the Patterns page to queue it first.
+      dispatch({ type: "ENSURE_PATTERN_QUEUED", patternId });
+      if (status === "stopped") handleSetSource("pattern");
+    },
+    playSongFrom: (beat) => void handlePlaySongFrom(beat),
+  });
+  // "+ Composer" (pattern strip, Patterns page): copy the pattern onto the selected lane and go to the Composer. The new
+  // sequence is selected by the pattern-added effect above, and the timeline scrolls it into view when that selection lands.
+  const handleAddToComposer = (patternId: PatternId) => {
+    dispatch({ type: "COMPOSER_ADD_PATTERN", patternId, laneId: composer.lane?.id });
+    handleSelectMainView("composer");
+  };
+  // "Edit ▸" on the Patterns page: open that pattern in the timeline (Sequencer view / Timeline tab).
+  const handleEditPattern = (id: PatternId) => {
+    setSelectedPatternId(id);
+    setTakeover("none");
+    if (layout.isPhone) setMobileTab("timeline");
+    else setMainView("sequencer");
+  };
+
+  // Track stepping (◀ ▶ in the Track column / phone Track tab): across all banks, moving the bank
+  // with the selection so the selected row is always the one on screen.
+  const selectedIndex = selectedTrack ? project.tracks.findIndex((t) => t.id === selectedTrack.id) : -1;
+  const handleStepTrack = (direction: -1 | 1) => {
+    const next = selectedIndex === -1 ? (direction === 1 ? 0 : -1) : selectedIndex + direction;
+    const track = project.tracks[next];
+    if (!track) return;
+    handleSelectTarget(track.id);
+    setActiveBank(Math.floor(next / BANK_SIZE));
+  };
+  const trackHeadLabel = selectedTrack
+    ? `${String(selectedIndex + 1).padStart(2, "0")} · ${trackHasSource(selectedTrack) ? selectedTrack.name : "empty"}`
+    : selectedTarget === "master"
+      ? "MASTER"
+      : "—";
+
+  // Stable identity until the project's scale changes, so the memoised Track Editor isn't re-rendered
+  // by every unrelated project edit.
+  const projectScale = useMemo(() => scaleOf(project), [project.scale]); // eslint-disable-line react-hooks/exhaustive-deps
+  const projectBarProps = {
+    saveStatus,
+    saveError,
+    savedProjects,
+    loadTargetId,
+    onNew: handleNewProject,
+    onSave: handleSaveProject,
+    onSelectSaved: setLoadTargetId,
+    onLoad: handleLoadProject,
+    onDelete: handleDeleteProject,
+    onExport: handleExportProject,
+    onImport: handleImportProject,
+    fileError,
+  };
+  const transportProps = {
+    status,
+    bpm: project.bpm,
+    followedBpm,
+    swing: project.swing,
+    gridResolution,
+    scale: projectScale,
+    onScaleChange: handleScaleChange,
+    onOpenGuide: handleOpenGuide,
+    onPlay: handlePlay,
+    onPause: handlePause,
+    onStop: handleStop,
+    onBpmChange: handleBpmChange,
+    onSwingChange: handleSwingChange,
+    onGridResolutionChange: setGridResolution,
+    zoomPercent,
+    canZoomIn,
+    canZoomOut,
+    onZoomIn,
+    onZoomOut,
+    getPositionText,
+    source: playbackSource,
+    onSourceChange: handleSetSource,
+    canResample: status === "playing" && playheadInfo?.patternId != null && resamplePhase !== "pending" && resamplePhase !== "processing",
+    onResample: handleResample,
+    resamplePhase,
+    resampleError,
+    getResampleLabel,
+  };
+  const instrumentProps = {
+    track: selectedTrack ?? null,
+    asset: selectedTrackAsset,
+    assetUseCount: selectedTrackAssetUseCount,
+    onSetInstrument: handleSetInstrument,
+    onSetInstrumentParam: handleSetInstrumentParam,
+    modulation: modulationUi,
+    onAddLfo: handleAddLfo,
+    onSetLfo: handleSetLfo,
+    onRemoveLfo: handleRemoveLfo,
+    onSetEnvelope: handleSetEnvelope,
+    onSetGain: handleSetAssetGain,
+    automation: automationFor(null),
+    onSetPlaybackMode: handleSetTrackPlaybackMode,
+    onSetVoiceMode: handleSetTrackVoiceMode,
+    onSetChokeGroup: handleSetTrackChokeGroup,
+    onSetTrackEnvelope: handleSetTrackEnvelope,
+    onSetSampleMode: handleSetSampleMode,
+    onSetCues: handleSetCues,
+    onSetChopStart: handleSetChopStart,
+    onAuditionSlice: handleAuditionSlice,
+    getAssetBytes,
+  };
+  const editProps = { clipboard: clipboardRows, barTools, chopTools, feedback: clipboardStatus, composer: mainView === "composer" ? composer.details : undefined, history: { canUndo, canRedo, onUndo: handleUndo, onRedo: handleRedo } };
+  const trackHeaderProps = {
+    track: selectedTrack ?? null,
+    label: trackHeadLabel,
+    canPrev: selectedIndex > 0,
+    canNext: selectedIndex < project.tracks.length - 1,
+    onStep: handleStepTrack,
+    onSetMuted: handleSetTrackMuted,
+    onSetSoloed: handleSetTrackSoloed,
+    playing: status === "playing",
+    onTogglePlay: () => (status === "playing" ? handleStop() : void handlePlay()),
+  };
+  const addPattern = () => dispatch({ type: "ADD_PATTERN" });
+  const setPatternBars = (id: PatternId, bars: number) => dispatch({ type: "SET_PATTERN_BARS", patternId: id, bars });
+  const duplicatePattern = (id: PatternId) => dispatch({ type: "DUPLICATE_PATTERN", patternId: id });
+  const removePattern = (id: PatternId) => {
+    const placed = sequencesOfPattern(project, id).length;
+    if (placed > 0 && !window.confirm(`This pattern is placed ${placed} time${placed === 1 ? "" : "s"} in the Composer. Delete it and remove those sequences?`)) return;
+    dispatch({ type: "REMOVE_PATTERN", patternId: id });
+  };
+  const renamePattern = (id: PatternId, name: string) => dispatch({ type: "RENAME_PATTERN", patternId: id, name });
+
+  return {
+    activeBank,
+    addPattern,
+    appRef,
+    assetDataRef,
+    automationFocus,
+    automationFor,
+    automationRow,
+    bankSummaries,
+    barTools,
+    bottomPanelView,
+    canRedo,
+    canUndo,
+    canZoomIn,
+    canZoomOut,
+    capabilities,
+    chopTools,
+    cleanBaselineRef,
+    clipboardRows,
+    clipboardStatus,
+    composer,
+    composerAutomationEdit,
+    composerAutomationSpans,
+    derived,
+    dispatch,
+    duplicatePattern,
+    editClipboard,
+    editProps,
+    editShowing,
+    ensurePlayback,
+    ensureTransport,
+    error,
+    fileError,
+    followedBpm,
+    fxLfoUi,
+    fxOwner,
+    getAssetBytes,
+    getBusId,
+    getGuideRuntime,
+    getPlayheadBeat,
+    getPlayingBarText,
+    getPositionText,
+    getResampleLabel,
+    getSongBeat,
+    getSongText,
+    gridResolution,
+    guideOpen,
+    guideOpenRef,
+    handleAddFx,
+    handleAddFxLfo,
+    handleAddLfo,
+    handleAddNote,
+    handleAddToComposer,
+    handleApplyRecipe,
+    handleAssignAsset,
+    handleAuditionAsset,
+    handleAuditionSlice,
+    handleBpmChange,
+    handleClearTrack,
+    handleCloseGuide,
+    handleCopyTrack,
+    handleDeleteProject,
+    handleDismissRecovery,
+    handleEditPattern,
+    handleExportProject,
+    handleImportProject,
+    handleLoadProject,
+    handleMoveChainEntry,
+    handleMoveFx,
+    handleMoveNote,
+    handleNewProject,
+    handleOpenGuide,
+    handlePasteNotes,
+    handlePause,
+    handlePickPattern,
+    handlePlay,
+    handlePlaySongFrom,
+    handleQueueNext,
+    handleRedo,
+    handleRemoveAsset,
+    handleRemoveChainEntry,
+    handleRemoveFx,
+    handleRemoveFxLfo,
+    handleRemoveLfo,
+    handleRemoveNote,
+    handleRenameAsset,
+    handleResample,
+    handleResetPatternSettings,
+    handleResizeNote,
+    handleRestoreRecovery,
+    handleSaveProject,
+    handleScaleChange,
+    handleSelectDockView,
+    handleSelectLibraryView,
+    handleSelectMainView,
+    handleSelectMobileTab,
+    handleSelectTarget,
+    handleSetAssetGain,
+    handleSetChopStart,
+    handleSetCues,
+    handleSetEnvelope,
+    handleSetFxEnabled,
+    handleSetFxLfo,
+    handleSetFxParam,
+    handleSetInstrument,
+    handleSetInstrumentParam,
+    handleSetLfo,
+    handleSetNoteChord,
+    handleSetNoteDuration,
+    handleSetNoteLfo,
+    handleSetNoteMode,
+    handleSetNotePitch,
+    handleSetNoteRatchet,
+    handleSetNoteTie,
+    handleSetNoteVelocity,
+    handleSetSampleMode,
+    handleSetSource,
+    handleSetTrackArp,
+    handleSetTrackChokeGroup,
+    handleSetTrackEnvelope,
+    handleSetTrackEventLfo,
+    handleSetTrackMuted,
+    handleSetTrackNotesLfo,
+    handleSetTrackNotesOff,
+    handleSetTrackNotesTie,
+    handleSetTrackOutput,
+    handleSetTrackPan,
+    handleSetTrackPlaybackMode,
+    handleSetTrackSend,
+    handleSetTrackSoloed,
+    handleSetTrackVoiceMode,
+    handleSetTrackVolume,
+    handleStepPattern,
+    handleStepTrack,
+    handleStop,
+    handleSwingChange,
+    handleTogglePicker,
+    handleToggleSettings,
+    handleTriggerTrack,
+    handleUndo,
+    history,
+    hostAnswered,
+    hostState,
+    importAsset,
+    importAssets,
+    importBatchResult,
+    init,
+    installProject,
+    instrumentProps,
+    launcher,
+    layout,
+    libraryView,
+    loadTargetId,
+    mainView,
+    manual,
+    midi,
+    midiSink,
+    noteTapRef,
+    mobileTab,
+    modulationUi,
+    noteClipboard,
+    onZoomIn,
+    onZoomOut,
+    playbackRef,
+    playbackSource,
+    playbackSourceRef,
+    playheadInfo,
+    playingChainEntryId,
+    playingPatternId,
+    playingSequenceIds,
+    playingSequenceKey,
+    preselectedForRef,
+    prevPatternIds,
+    pristineRef,
+    project,
+    projectBarProps,
+    projectRef,
+    projectScale,
+    pushSequence,
+    pxPerBeat,
+    recoveryChecked,
+    recoveryPrompt,
+    recoveryScheduler,
+    refreshSavedProjects,
+    removePattern,
+    renamePattern,
+    resampleError,
+    resamplePhase,
+    restoreRecord,
+    restoredSnapshotRef,
+    runtime,
+    saveError,
+    saveStatus,
+    savedProjects,
+    selectedFxId,
+    selectedIndex,
+    selectedKindId,
+    selectedNote,
+    selectedNoteId,
+    selectedPattern,
+    selectedPatternId,
+    selectedTarget,
+    selectedTargetRef,
+    selectedTrack,
+    selectedTrackAsset,
+    selectedTrackAssetUseCount,
+    selectedTrackHasNotes,
+    sentRouteRef,
+    sentSequenceRef,
+    setActiveBank,
+    setBottomPanelView,
+    setClipboardStatus,
+    setEditClipboard,
+    setFileError,
+    setFollowedBpm,
+    setGridResolution,
+    setGuideOpen,
+    setHostAnswered,
+    setImportBatchResult,
+    setLibraryView,
+    setLoadTargetId,
+    setMainView,
+    setManual,
+    setMobileTab,
+    setNoteClipboard,
+    setPatternBars,
+    setPlaybackSourceState,
+    setRecoveryChecked,
+    setRecoveryPrompt,
+    setResampleError,
+    setResamplePhase,
+    setSaveError,
+    setSaveStatus,
+    setSavedProjects,
+    setSelectedFxId,
+    setSelectedNoteId,
+    setSelectedPatternId,
+    setSelectedTarget,
+    setSidePanelView,
+    setStatus,
+    setTakeover,
+    setTrackSubTab,
+    sidePanelView,
+    spectrumTapFor,
+    status,
+    takeover,
+    trackBusesRef,
+    trackHeadLabel,
+    trackHeaderProps,
+    trackSubTab,
+    transportProps,
+    transportRef,
+    unavailableKinds,
+    zoomPercent,
+  };
+}
+
+export type Webseq = ReturnType<typeof useWebseq>;
